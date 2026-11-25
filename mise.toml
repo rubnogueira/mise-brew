@@ -1,0 +1,20 @@
+[tools]
+go = "1.27"
+
+[tasks.build]
+description = "Build bin/brew"
+run = "go build -trimpath -ldflags='-s -w' -o bin/brew ."
+
+[tasks.test]
+description = "Run the unit tests"
+run = "go test ./..."
+
+[tasks.install]
+description = "Install bin/brew as $PREFIX/bin/brew (default /opt/homebrew)"
+depends = ["build"]
+run = '''
+prefix="${PREFIX:-$(./bin/brew --prefix)}"
+mkdir -p "$prefix/bin"
+install -m 0755 bin/brew "$prefix/bin/brew"
+echo "installed $prefix/bin/brew"
+'''
