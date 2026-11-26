@@ -160,13 +160,7 @@ func run(argv []string) (code int) {
 			panic(r)
 		}
 	}()
-	if os.Getenv(recursionEnv) != "" && os.Getenv("MISEBREW_ALLOW_NESTED") == "" {
-		// mise itself invoked `brew`: answer read-only queries, refuse anything else.
-		if len(argv) > 0 && !isReadOnly(canonical(argv[0])) {
-			onoe("mise-brew was called from inside mise (%s); refusing to recurse.", strings.Join(argv, " "))
-			return 1
-		}
-	}
+	full := argv
 
 	// Leading global flags (brew -v install foo, brew --debug ...).
 	for len(argv) > 0 {
@@ -194,6 +188,13 @@ dispatch:
 	}
 	name := canonical(argv[0])
 	rest := argv[1:]
+	if os.Getenv(recursionEnv) != "" && os.Getenv("MISEBREW_ALLOW_NESTED") == "" {
+		// mise itself invoked `brew`: answer read-only queries, refuse anything else.
+		if !isReadOnly(name, rest) {
+			onoe("mise-brew was called from inside mise (%s); refusing to recurse.", strings.Join(full, " "))
+			return 1
+		}
+	}
 	if name == "--version" || (len(argv) == 1 && argv[0] == "-v") {
 		cmdVersion(rest)
 		return 0
@@ -243,13 +244,46 @@ func canonical(n string) string {
 	return n
 }
 
-func isReadOnly(cmd string) bool {
-	switch cmd {
-	case "install", "reinstall", "uninstall", "upgrade", "update", "autoremove", "cleanup",
-		"bundle", "tap", "untap", "link", "unlink", "pin", "unpin", "services", "tab", "sh", "postinstall", "fetch", "alias", "unalias", "unpack", "edit":
-		return false
+// readOnlyCommands never change the prefix, mise config or caches through
+// mise, so they are safe to answer when mise itself runs `brew`. Anything not
+// listed (including aliases, external commands and unknown commands) is
+// refused under MISEBREW_ACTIVE.
+var readOnlyCommands = map[string]bool{
+	"list": true, "info": true, "search": true, "desc": true, "deps": true, "uses": true,
+	"leaves": true, "missing": true, "cat": true, "formulae": true, "casks": true,
+	"options": true, "which-formula": true, "log": true, "linkage": true, "formula": true,
+	"command": true, "outdated": true, "tap-info": true, "command-not-found-init": true,
+	"--prefix": true, "--cellar": true, "--caskroom": true, "--cache": true,
+	"--repository": true, "--version": true, "--env": true, "shellenv": true,
+	"config": true, "doctor": true, "commands": true, "help": true,
+	"analytics": true, "developer": true, "completions": true,
+}
+
+// isReadOnly reports whether `brew cmd args...` is a read-only invocation.
+// cmd must already be canonical and stripped of leading global flags.
+func isReadOnly(cmd string, args []string) bool {
+	if readOnlyCommands[cmd] {
+		return true
 	}
-	return true
+	sub := ""
+	if cmd == "bundle" || cmd == "services" || cmd == "tap" {
+		prev := currentCmd
+		currentCmd = cmd
+		o := parseArgs(args, nil, nil)
+		currentCmd = prev
+		if len(o.Pos) > 0 {
+			sub = o.Pos[0]
+		}
+		switch cmd {
+		case "bundle":
+			return (sub == "check" || sub == "list") && !o.Has("install")
+		case "services":
+			return sub == "" || sub == "list" || sub == "ls" || sub == "info" || sub == "i"
+		case "tap":
+			return sub == "" // listing taps
+		}
+	}
+	return false
 }
 
 func execExternal(path string, args []string) int {
