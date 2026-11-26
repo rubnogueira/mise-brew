@@ -415,9 +415,9 @@ func cmdInfo(args []string) {
 		if o.Has("github") {
 			url := ""
 			if f := lookupFormula(n); f != nil && !o.onlyCask() {
-				url = "https://github.com/Homebrew/homebrew-core/blob/HEAD/" + f.RubySourcePath
-			} else if c := lookupCask(n); c != nil {
-				url = "https://github.com/Homebrew/homebrew-cask/blob/HEAD/" + c.RubySourcePath
+				url = formulaSourceURL(f)
+			} else if c := lookupCask(n); c != nil && !o.onlyFormula() {
+				url = caskSourceURL(c)
 			}
 			if url != "" {
 				openURL(url)
@@ -503,13 +503,8 @@ func infoFormula(f *Formula) {
 		}
 	}
 	printInstalledKegs(f.Name)
-	if f.RubySourcePath != "" {
-		repo := "Homebrew/homebrew-core"
-		if f.Tap != "" && f.Tap != "homebrew/core" {
-			o, r := tapRepo(f.Tap)
-			repo = o + "/" + r
-		}
-		fmt.Printf("From: https://github.com/%s/blob/HEAD/%s\n", repo, f.RubySourcePath)
+	if u := formulaSourceURL(f); u != "" {
+		fmt.Printf("From: %s\n", u)
 	}
 	if f.License != "" {
 		fmt.Printf("License: %s\n", f.License)
@@ -574,6 +569,38 @@ func infoFormula(f *Formula) {
 		fmt.Println(txt)
 	}
 	printAnalytics("formula", f.Name)
+}
+
+// formulaSourceURL is the GitHub URL of a formula's Ruby source ("" if unknown).
+func formulaSourceURL(f *Formula) string {
+	if f.RubySourcePath == "" {
+		return ""
+	}
+	repo := "Homebrew/homebrew-core"
+	if !formulaFromCore(f) {
+		o, r := tapRepo(f.Tap)
+		if o == "" {
+			return ""
+		}
+		repo = o + "/" + r
+	}
+	return "https://github.com/" + repo + "/blob/HEAD/" + f.RubySourcePath
+}
+
+// caskSourceURL is the GitHub URL of a cask's Ruby source ("" if unknown).
+func caskSourceURL(c *Cask) string {
+	if c.RubySourcePath == "" {
+		return ""
+	}
+	repo := "Homebrew/homebrew-cask"
+	if !caskFromCore(c) {
+		o, r := tapRepo(c.Tap)
+		if o == "" {
+			return ""
+		}
+		repo = o + "/" + r
+	}
+	return "https://github.com/" + repo + "/blob/HEAD/" + c.RubySourcePath
 }
 
 // showAnalytics follows Homebrew: shown in interactive `brew info` unless disabled.
@@ -757,8 +784,8 @@ func infoCask(c *Cask) {
 	} else {
 		fmt.Println("Not installed")
 	}
-	if c.RubySourcePath != "" {
-		fmt.Printf("From: https://github.com/Homebrew/homebrew-cask/blob/HEAD/%s\n", c.RubySourcePath)
+	if u := caskSourceURL(c); u != "" {
+		fmt.Printf("From: %s\n", u)
 	}
 	if len(c.Name) > 0 {
 		ohai("Name")
@@ -810,17 +837,24 @@ func infoJSON(o Opts, version string) {
 	if version == "v1" && o.onlyCask() {
 		odie("Invalid usage: Cannot specify `--cask` when using `--json=v1`!")
 	}
+	// Formulae are resolved up front so tap formulae are reported from their
+	// tap, not from a homebrew/core formula with the same name.
+	type fref struct {
+		name string
+		f    *Formula
+	}
+	var frefs []fref
 	var fnames, cnames []string
 	switch {
 	case len(o.Pos) > 0:
 		for _, n := range o.Pos {
 			if !o.onlyCask() {
 				if f := lookupFormula(n); f != nil {
-					fnames = append(fnames, f.Name)
+					frefs = append(frefs, fref{f.Name, f})
 					continue
 				}
 				if r := resolveInstalledFormula(n); r != "" {
-					fnames = append(fnames, r)
+					frefs = append(frefs, fref{r, nil})
 					continue
 				}
 			}
@@ -849,9 +883,23 @@ func infoJSON(o Opts, version string) {
 	default:
 		odie("Invalid usage: This command's option requires a formula argument")
 	}
-	formulae := []any{}
 	for _, n := range fnames {
-		formulae = append(formulae, formulaJSON(n))
+		var f *Formula
+		switch {
+		case installedTapOf(n) != "":
+			f = lookupFormula(installedTapOf(n) + "/" + n)
+		case isFormulaInstalled(n):
+			f = lookupFormula(n)
+		default:
+			// --eval-all: only the API record is needed (formulaMapFor of a
+			// bare core formula reads it); skip decoding every formula.
+			f = &Formula{Name: n}
+		}
+		frefs = append(frefs, fref{n, f})
+	}
+	formulae := []any{}
+	for _, r := range frefs {
+		formulae = append(formulae, formulaJSON(r.name, r.f))
 	}
 	if version == "v1" {
 		printJSON(formulae)
@@ -864,8 +912,13 @@ func infoJSON(o Opts, version string) {
 	printJSON(map[string]any{"formulae": formulae, "casks": casks})
 }
 
-func formulaJSON(name string) map[string]any {
-	m := rawFormulaMap(name)
+// formulaJSON returns the JSON record of the installed rack name; f is the
+// resolved formula (nil when only the keg is known).
+func formulaJSON(name string, f *Formula) map[string]any {
+	var m map[string]any
+	if f != nil {
+		m = formulaMapFor(f)
+	}
 	if m == nil {
 		// Installed from a tap mise has no API data for: synthesize from the receipt.
 		v := currentVersion(name)
@@ -888,7 +941,8 @@ func formulaJSON(name string) map[string]any {
 		if r := readReceipt(kegPath(name, v)); r != nil {
 			deps := []any{}
 			for _, d := range r.RuntimeDependencies {
-				deps = append(deps, map[string]any{"full_name": d.FullName, "version": d.Version, "revision": 0, "pkg_version": d.PkgVersion, "declared_directly": d.Declared})
+				_, rev := splitRevision(d.PkgVersion)
+				deps = append(deps, map[string]any{"full_name": d.FullName, "version": d.Version, "revision": rev, "pkg_version": d.PkgVersion, "declared_directly": d.Declared})
 			}
 			e["built_as_bottle"] = r.BuiltAsBottle
 			e["poured_from_bottle"] = r.PouredFromBottle
@@ -911,7 +965,7 @@ func formulaJSON(name string) map[string]any {
 	}
 	m["pinned"] = isPinned(name)
 	outdated := false
-	if f := lookupFormula(name); f != nil && len(inst) > 0 {
+	if f != nil && len(inst) > 0 {
 		outdated = kegOutdated(name, f)
 	}
 	m["outdated"] = outdated
@@ -1317,15 +1371,19 @@ func depFilterFrom(o Opts) depFilter {
 	}
 }
 
+// directDeps lists the direct dependencies of a formula. name may be
+// tap-qualified; dependencies on third-party tap formulae keep their
+// user/repo/name form (core ones are bare names).
 func directDeps(name string, flt depFilter) []string {
 	f := lookupFormula(name)
 	if f == nil {
-		// Unknown to the API (third-party tap): fall back to the install receipt.
+		// Unknown to the API and taps: fall back to the install receipt.
 		var out []string
-		if r := readReceipt(kegPath(name, currentVersion(name))); r != nil {
+		rack := baseName(name)
+		if r := readReceipt(kegPath(rack, currentVersion(rack))); r != nil {
 			for _, d := range r.RuntimeDependencies {
 				if d.Declared {
-					out = append(out, baseName(d.FullName))
+					out = append(out, stripCoreTap(d.FullName))
 				}
 			}
 		}
@@ -1335,7 +1393,7 @@ func directDeps(name string, flt depFilter) []string {
 	var out []string
 	add := func(ds ...string) {
 		for _, d := range ds {
-			d = baseName(d)
+			d = tapDepName(f, d)
 			if !seen[d] {
 				seen[d] = true
 				out = append(out, d)
@@ -1367,10 +1425,47 @@ func directDeps(name string, flt depFilter) []string {
 	return out
 }
 
+// tapDepName normalises a dependency name declared by f: homebrew/core
+// prefixes are dropped, and a bare name in a third-party tap formula that is
+// not a core formula but exists in the same tap is qualified with that tap.
+func tapDepName(f *Formula, d string) string {
+	d = stripCoreTap(d)
+	if formulaFromCore(f) || strings.Contains(d, "/") || f.Tap == "" {
+		return d
+	}
+	if formulaAPI.Available() {
+		if _, ok := formulaAPI.Raw(d); ok {
+			return d
+		}
+	}
+	if ti := loadTapIndex(f.Tap); ti != nil {
+		if _, ok := ti.Formulae[d]; ok {
+			return f.Tap + "/" + d
+		}
+	}
+	return d
+}
+
+// depInstalled reports whether a (possibly tap-qualified) dependency has a keg.
+func depInstalled(d string) bool { return isFormulaInstalled(baseName(d)) }
+
+// sameDep reports whether declared dependency x refers to dep.
+func sameDep(f *Formula, x, dep string) bool { return x == dep || tapDepName(f, x) == dep }
+
+func containsDep(f *Formula, xs []string, dep string) bool {
+	for _, x := range xs {
+		if sameDep(f, x, dep) {
+			return true
+		}
+	}
+	return false
+}
+
 // recursiveDeps returns deps in topological order (dependencies before dependents).
 func recursiveDeps(f *Formula, flt depFilter) []string {
 	var order []string
-	seen := map[string]bool{f.Name: true}
+	root := qualifiedFormulaName(f)
+	seen := map[string]bool{root: true}
 	var visit func(string)
 	visit = func(n string) {
 		for _, d := range directDeps(n, flt) {
@@ -1382,7 +1477,7 @@ func recursiveDeps(f *Formula, flt depFilter) []string {
 			order = append(order, d)
 		}
 	}
-	visit(f.Name)
+	visit(root)
 	return order
 }
 
@@ -1399,18 +1494,21 @@ func depsOf(name string, flt depFilter, direct bool) []string {
 
 // depType classifies how formula `parent` depends on `dep` (for --annotate).
 func depType(parent, dep string) string {
+	if strings.HasPrefix(parent, "cask:") {
+		return ""
+	}
 	f := lookupFormula(parent)
 	if f == nil {
 		return ""
 	}
 	switch {
-	case contains(f.BuildDependencies, dep):
+	case containsDep(f, f.BuildDependencies, dep):
 		return "build"
-	case contains(f.TestDependencies, dep):
+	case containsDep(f, f.TestDependencies, dep):
 		return "test"
-	case contains(f.OptionalDependencies, dep):
+	case containsDep(f, f.OptionalDependencies, dep):
 		return "optional"
-	case contains(f.RecommendedDependencies, dep):
+	case containsDep(f, f.RecommendedDependencies, dep):
 		return "recommended"
 	}
 	for i, e := range usesFromMacos(f) {
@@ -1476,19 +1574,44 @@ func cmdDeps(args []string) {
 			odie("Invalid usage: This command requires at least 1 formula argument.")
 		}
 	}
+	// Formulae are keyed by name (tap-qualified for third-party taps), casks
+	// by "cask:" + token (likewise). Formulae win unless --cask is given, so
+	// the (slow) cask lookup only runs for names that are not formulae.
 	var canon []string
 	for _, n := range names {
-		if c := lookupCask(n); c != nil && (o.onlyCask() || (lookupFormula(n) == nil && resolveInstalledFormula(n) == "")) {
-			canon = append(canon, "cask:"+c.Token)
-			continue
+		if !o.onlyCask() {
+			if f := lookupFormula(n); f != nil {
+				canon = append(canon, qualifiedFormulaName(f))
+				continue
+			}
+			if r := resolveInstalledFormula(n); r != "" {
+				canon = append(canon, r)
+				continue
+			}
 		}
-		if f := lookupFormula(n); f != nil {
-			canon = append(canon, f.Name)
-		} else if r := resolveInstalledFormula(n); r != "" {
-			canon = append(canon, r)
-		} else {
-			odie("No available formula with the name \"%s\".", n)
+		if !o.onlyFormula() {
+			if c := lookupCask(n); c != nil {
+				canon = append(canon, "cask:"+qualifiedCaskToken(c))
+				continue
+			}
 		}
+		if o.onlyCask() {
+			odie("No available cask with the name \"%s\".", n)
+		}
+		odie("No available formula with the name \"%s\".", n)
+	}
+	// caskDeps returns the formula dependencies of a "cask:" key, and its
+	// cask dependencies as "cask:" keys.
+	caskDeps := func(n string) []string {
+		c := lookupCask(strings.TrimPrefix(n, "cask:"))
+		if c == nil {
+			return nil
+		}
+		ds := append([]string{}, c.DependsOn.Formula...)
+		for _, d := range c.DependsOn.Cask {
+			ds = append(ds, "cask:"+d)
+		}
+		return ds
 	}
 	// Installed formulae use their installed runtime dependencies unless
 	// --declared (or build/test deps, which receipts don't record) is asked for.
@@ -1505,19 +1628,21 @@ func cmdDeps(args []string) {
 		var ds []string
 		switch {
 		case strings.HasPrefix(n, "cask:"):
-			c := lookupCask(strings.TrimPrefix(n, "cask:"))
-			for _, d := range c.DependsOn.Formula {
-				ds = append(ds, d)
-				if !direct {
-					ds = append(ds, depsOf(d, flt, false)...)
+			if c := lookupCask(strings.TrimPrefix(n, "cask:")); c != nil {
+				for _, d := range c.DependsOn.Formula {
+					ds = append(ds, d)
+					if !direct {
+						ds = append(ds, depsOf(d, flt, false)...)
+					}
 				}
 			}
 			ds = dedupe(ds)
-		case useInstalled && isFormulaInstalled(n):
-			if r := readReceipt(kegPath(n, currentVersion(n))); r != nil {
+		case useInstalled && depInstalled(n):
+			rack := baseName(n)
+			if r := readReceipt(kegPath(rack, currentVersion(rack))); r != nil {
 				for _, d := range r.RuntimeDependencies {
 					if !direct || d.Declared {
-						ds = append(ds, baseName(d.FullName))
+						ds = append(ds, stripCoreTap(d.FullName))
 					}
 				}
 			}
@@ -1527,7 +1652,7 @@ func cmdDeps(args []string) {
 		if o.Has("installed") {
 			var keep []string
 			for _, d := range ds {
-				if isFormulaInstalled(d) {
+				if depInstalled(d) {
 					keep = append(keep, d)
 				}
 			}
@@ -1536,7 +1661,7 @@ func cmdDeps(args []string) {
 		if o.Has("missing") {
 			var keep []string
 			for _, d := range ds {
-				if !isFormulaInstalled(d) {
+				if !depInstalled(d) {
 					keep = append(keep, d)
 				}
 			}
@@ -1569,12 +1694,18 @@ func cmdDeps(args []string) {
 				return
 			}
 			seen[n] = true
-			for _, d := range directDeps(strings.TrimPrefix(n, "cask:"), flt) {
+			var ds []string
+			if strings.HasPrefix(n, "cask:") {
+				ds = caskDeps(n)
+			} else {
+				ds = directDeps(n, flt)
+			}
+			for _, d := range ds {
 				style := ""
 				if t := depType(n, d); t == "build" || t == "test" || t == "optional" {
 					style = " [style=dashed]"
 				}
-				fmt.Fprintf(&b, "  \"%s\" -> \"%s\"%s\n", strings.TrimPrefix(n, "cask:"), d, style)
+				fmt.Fprintf(&b, "  %s -> %s%s\n", dotQuote(strings.TrimPrefix(n, "cask:")), dotQuote(strings.TrimPrefix(d, "cask:")), style)
 				if !direct {
 					walk(d)
 				}
@@ -1588,7 +1719,7 @@ func cmdDeps(args []string) {
 			fmt.Print(b.String())
 			return
 		}
-		html := "<!DOCTYPE html><html><body><script src=\"https://cdn.jsdelivr.net/npm/viz.js@2.1.2/viz.js\"></script><script src=\"https://cdn.jsdelivr.net/npm/viz.js@2.1.2/full.render.js\"></script><div id=g></div><script>new Viz().renderSVGElement(" + strconv.Quote(b.String()) + ").then(e=>document.getElementById('g').appendChild(e))</script></body></html>"
+		html := "<!DOCTYPE html><html><body><script src=\"https://cdn.jsdelivr.net/npm/viz.js@2.1.2/viz.js\"></script><script src=\"https://cdn.jsdelivr.net/npm/viz.js@2.1.2/full.render.js\"></script><div id=g></div><script>new Viz().renderSVGElement(" + jsString(b.String()) + ").then(e=>document.getElementById('g').appendChild(e))</script></body></html>"
 		p := filepath.Join(miseBrewCacheDir(), "deps-graph.html")
 		_ = os.MkdirAll(filepath.Dir(p), 0o755)
 		if err := os.WriteFile(p, []byte(html), 0o644); err != nil {
@@ -1654,6 +1785,18 @@ func cmdDeps(args []string) {
 	}
 }
 
+// dotQuote renders s as a Graphviz quoted ID.
+func dotQuote(s string) string {
+	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`).Replace(s) + `"`
+}
+
+// jsString renders s as a JavaScript string literal safe inside <script>:
+// <, > and & are escaped as \u003c etc., as are U+2028/U+2029.
+func jsString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
 func dedupe(xs []string) []string {
 	seen := map[string]bool{}
 	var out []string
@@ -1670,7 +1813,7 @@ func printTree(n string, flt depFilter, indent string, path map[string]bool, ins
 	var ds []string
 	if strings.HasPrefix(n, "cask:") {
 		if c := lookupCask(strings.TrimPrefix(n, "cask:")); c != nil {
-			ds = c.DependsOn.Formula
+			ds = append(ds, c.DependsOn.Formula...)
 		}
 	} else {
 		ds = directDeps(n, flt)
@@ -1678,7 +1821,7 @@ func printTree(n string, flt depFilter, indent string, path map[string]bool, ins
 	if installedOnly {
 		var keep []string
 		for _, d := range ds {
-			if isFormulaInstalled(d) {
+			if depInstalled(d) {
 				keep = append(keep, d)
 			}
 		}
@@ -1722,17 +1865,23 @@ func cmdUses(args []string) {
 	}
 	flt := depFilterFrom(o)
 	var targets []string
+	missing := false
 	for _, n := range o.Pos {
 		if f := lookupFormula(n); f != nil {
-			targets = append(targets, f.Name)
+			targets = append(targets, qualifiedFormulaName(f))
 		} else {
-			targets = append(targets, baseName(stripCoreTap(n)))
+			// Like Homebrew: warn, then look for dependents of the bare name.
+			opoo("No available formula with the name \"%s\".", n)
+			missing = true
+			targets = append(targets, stripCoreTap(n))
 		}
 	}
 	var candidates []string
-	if o.Has("installed") {
+	switch {
+	case o.onlyCask():
+	case o.Has("installed"):
 		candidates = installedFormulae()
-	} else {
+	default:
 		ensureAPI()
 		candidates = formulaAPI.Names()
 	}
@@ -1800,8 +1949,14 @@ func cmdUses(args []string) {
 		}
 		out = keep
 	}
+	if len(out) == 0 {
+		return
+	}
 	sort.Strings(out)
 	putsColumns(out)
+	if missing {
+		odie("Missing formulae should not have dependents!")
+	}
 }
 
 func cmdLeaves(args []string) {
@@ -1846,10 +2001,12 @@ func cmdMissing(args []string) {
 	if len(o.Pos) > 0 {
 		names = requireInstalled(o.Pos)
 	}
+	// Like Homebrew, --hide pretends the listed formulae are not installed,
+	// so dependencies on them are reported as missing.
 	hide := map[string]bool{}
 	if v, ok := o.Val("hide"); ok {
 		for _, h := range strings.Split(v, ",") {
-			hide[h] = true
+			hide[baseName(strings.TrimSpace(h))] = true
 		}
 	}
 	found := false
@@ -1861,14 +2018,17 @@ func cmdMissing(args []string) {
 		var miss []string
 		for _, d := range r.RuntimeDependencies {
 			b := baseName(d.FullName)
-			if !isFormulaInstalled(b) && !hide[b] {
+			if hide[b] || !isFormulaInstalled(b) {
 				miss = append(miss, b)
 			}
 		}
 		if len(miss) > 0 {
 			found = true
 			sort.Strings(miss)
-			fmt.Printf("%s: %s\n", n, strings.Join(miss, " "))
+			if len(names) > 1 {
+				fmt.Printf("%s: ", n)
+			}
+			fmt.Println(strings.Join(miss, " "))
 		}
 	}
 	if found {
