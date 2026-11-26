@@ -11,6 +11,9 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
+
+	"github.com/BurntSushi/toml"
 )
 
 // recursionEnv is set on every mise child so a mise that shells out to `brew`
@@ -20,7 +23,30 @@ const recursionEnv = "MISEBREW_ACTIVE"
 func miseCmd(args ...string) *exec.Cmd {
 	cmd := exec.Command(miseBin(), args...)
 	cmd.Env = append(os.Environ(), recursionEnv+"=1")
+	if e := miseEnv(); e != "" {
+		cmd.Env = append(cmd.Env, "MISE_ENV="+e)
+	}
 	return cmd
+}
+
+// miseEnv returns the MISE_ENV for mise children. MISEBREW_ENV makes `use -e`
+// write to mise.<ENV>.toml, so every other call (config ls, status, prune,
+// install) must load that environment too or those declarations are invisible.
+func miseEnv() string {
+	e := os.Getenv("MISEBREW_ENV")
+	cur := os.Getenv("MISE_ENV")
+	if e == "" {
+		return ""
+	}
+	for _, v := range strings.Split(cur, ",") {
+		if strings.TrimSpace(v) == e {
+			return cur
+		}
+	}
+	if strings.TrimSpace(cur) == "" {
+		return e
+	}
+	return cur + "," + e
 }
 
 // runMise runs mise attached to the terminal and returns its exit code.
@@ -95,14 +121,24 @@ func recordEnabled() bool {
 
 // --- config files -----------------------------------------------------------
 
+// configFiles lists the mise config files that may declare packages. A file
+// reached through several paths (symlinks) is listed once, under the first
+// path seen, so it is never edited twice.
 func configFiles() []string {
 	seen := map[string]bool{}
 	var files []string
 	add := func(p string) {
-		if p == "" || seen[p] || !fileExists(p) {
+		if p == "" || !fileExists(p) {
 			return
 		}
-		seen[p] = true
+		key := p
+		if real, err := filepath.EvalSymlinks(p); err == nil {
+			key = real
+		}
+		if seen[key] {
+			return
+		}
+		seen[key] = true
 		files = append(files, p)
 	}
 	if v := os.Getenv("MISEBREW_CONFIG"); v != "" && v != "global" && v != "local" {
@@ -135,9 +171,22 @@ type declaration struct {
 	Line     int // 0-based
 	Text     string
 	Editable bool
+	Key      string // package key, e.g. "brew:jq"
+	End      int    // 0-based exclusive last line; a sub-table spans several lines
 }
 
-var tableHeaderRe = regexp.MustCompile(`^\s*\[\s*([^\[\]]+?)\s*\]\s*(#.*)?$`)
+// lineEnd returns the exclusive end line of d.
+func (d declaration) lineEnd() int {
+	if d.End <= d.Line {
+		return d.Line + 1
+	}
+	return d.End
+}
+
+var (
+	tableHeaderRe = regexp.MustCompile(`^\s*\[\s*([^\[\]]+?)\s*\]\s*(#.*)?$`)
+	arrayHeaderRe = regexp.MustCompile(`^\s*\[\[\s*([^\[\]]+?)\s*\]\]\s*(#.*)?$`)
+)
 
 func normalizeTOMLKey(k string) string {
 	k = strings.TrimSpace(k)
@@ -199,9 +248,70 @@ func keyOfLine(line string) (string, string, bool) {
 	return "", "", false
 }
 
-// findDeclarations finds `"<pkg>" = ...` entries of [bootstrap.packages] in all config files.
+// tomlScan tracks whether a TOML value continues onto the next line: inside a
+// multi-line string, or with an array or inline table still open.
+type tomlScan struct {
+	ml    string // `"""` or `'''` while inside a multi-line string
+	depth int    // unclosed [ and { outside strings
+}
+
+func (s *tomlScan) open() bool { return s.ml != "" || s.depth > 0 }
+
+func (s *tomlScan) feed(text string) {
+	for i := 0; i < len(text); {
+		if s.ml != "" {
+			switch {
+			case s.ml == `"""` && text[i] == '\\':
+				i += 2
+			case strings.HasPrefix(text[i:], s.ml):
+				// up to two quotes may directly precede the closing delimiter
+				j := i + 3
+				for j < len(text) && j < i+5 && text[j] == s.ml[0] {
+					j++
+				}
+				i, s.ml = j, ""
+			default:
+				i++
+			}
+			continue
+		}
+		switch c := text[i]; {
+		case c == '#':
+			return
+		case strings.HasPrefix(text[i:], `"""`) || strings.HasPrefix(text[i:], `'''`):
+			s.ml = text[i : i+3]
+			i += 3
+		case c == '"' || c == '\'':
+			j := i + 1
+			for j < len(text) && text[j] != c {
+				if c == '"' && text[j] == '\\' {
+					j++
+				}
+				j++
+			}
+			i = j + 1
+		case c == '[' || c == '{':
+			s.depth++
+			i++
+		case c == ']' || c == '}':
+			if s.depth > 0 {
+				s.depth--
+			}
+			i++
+		default:
+			i++
+		}
+	}
+}
+
+// findDeclarations finds `"<pkg>" = ...` entries of [bootstrap.packages] (and
+// [bootstrap.packages."<pkg>"] sub-tables) in all config files.
 func findDeclarations(pkg string, files []string) []declaration {
 	var out []declaration
+	target := "bootstrap.packages." + pkg
+	quoted := func(line string) bool {
+		return strings.Contains(line, `"`+pkg+`"`) || strings.Contains(line, `'`+pkg+`'`)
+	}
 	for _, f := range files {
 		data, err := os.ReadFile(f)
 		if err != nil {
@@ -209,32 +319,79 @@ func findDeclarations(pkg string, files []string) []declaration {
 		}
 		lines := strings.Split(string(data), "\n")
 		table := ""
+		var cont tomlScan // a multi-line value being skipped
+		contKey := ""
+		sub, subLast := -1, 0 // open [bootstrap.packages."<pkg>"] declaration and its last content line
+		closeSub := func() {
+			if sub >= 0 {
+				out[sub].End = subLast + 1
+				out[sub].Text = strings.Join(lines[out[sub].Line:subLast+1], "\n")
+				sub = -1
+			}
+		}
 		for i, line := range lines {
-			if m := tableHeaderRe.FindStringSubmatch(line); m != nil && !strings.HasPrefix(strings.TrimSpace(line), "[[") {
+			if cont.open() {
+				inString := cont.ml != ""
+				cont.feed(line)
+				if sub >= 0 {
+					subLast = i
+				}
+				if !inString && strings.HasPrefix(contKey, "bootstrap") && quoted(line) {
+					out = append(out, declaration{File: f, Line: i, Text: line, Key: pkg, End: i + 1})
+				}
+				continue
+			}
+			m := arrayHeaderRe.FindStringSubmatch(line)
+			isArray := m != nil
+			if m == nil {
+				m = tableHeaderRe.FindStringSubmatch(line)
+			}
+			if m != nil {
+				closeSub()
 				table = normalizeTOMLKey(m[1])
+				switch {
+				case table == target && !isArray:
+					out = append(out, declaration{File: f, Line: i, Text: line, Editable: true, Key: pkg, End: i + 1})
+					sub, subLast = len(out)-1, i
+				case table == target || strings.HasPrefix(table, target+"."):
+					out = append(out, declaration{File: f, Line: i, Text: line, Key: pkg, End: i + 1})
+				}
 				continue
 			}
 			key, val, ok := keyOfLine(line)
 			if !ok {
-				if strings.HasPrefix(strings.TrimSpace(line), "#") {
+				t := strings.TrimSpace(line)
+				if t == "" || strings.HasPrefix(t, "#") {
 					continue
 				}
-				if strings.Contains(line, `"`+pkg+`"`) || strings.Contains(line, `'`+pkg+`'`) {
-					out = append(out, declaration{f, i, line, false})
+				if sub >= 0 {
+					subLast = i
+				}
+				if quoted(line) {
+					out = append(out, declaration{File: f, Line: i, Text: line, Key: pkg, End: i + 1})
 				}
 				continue
+			}
+			if sub >= 0 {
+				subLast = i
 			}
 			full := key
 			if table != "" {
 				full = table + "." + key
 			}
-			if full == "bootstrap.packages."+pkg {
-				editable := !strings.HasPrefix(val, "{") || strings.HasSuffix(strings.TrimSpace(stripComment(val)), "}")
-				out = append(out, declaration{f, i, line, editable})
-			} else if strings.Contains(line, `"`+pkg+`"`) && (full == "bootstrap.packages" || strings.HasPrefix(full, "bootstrap")) {
-				out = append(out, declaration{f, i, line, false})
+			var s tomlScan
+			s.feed(val)
+			if s.open() {
+				cont, contKey = s, full
+			}
+			if full == target {
+				// a value spanning lines can't be removed line by line
+				out = append(out, declaration{File: f, Line: i, Text: line, Editable: !s.open(), Key: pkg, End: i + 1})
+			} else if quoted(line) && strings.HasPrefix(full, "bootstrap") {
+				out = append(out, declaration{File: f, Line: i, Text: line, Key: pkg, End: i + 1})
 			}
 		}
+		closeSub()
 	}
 	return out
 }
@@ -256,6 +413,13 @@ func stripComment(v string) string {
 	return v
 }
 
+// configBackup is a config file's content before mise-brew rewrote it.
+type configBackup struct {
+	Path string // real path (symlinks resolved)
+	Data []byte
+	Mode os.FileMode
+}
+
 // removeDeclarations deletes the given lines, writing through symlinks atomically.
 func removeDeclarations(decls []declaration) error {
 	_, err := removeDeclarationsBackup(decls)
@@ -264,31 +428,60 @@ func removeDeclarations(decls []declaration) error {
 
 // removeDeclarationsBackup removes lines and returns the original contents per real file.
 func removeDeclarationsBackup(decls []declaration) (map[string][]byte, error) {
-	backup := map[string][]byte{}
-	byFile := map[string][]int{}
-	for _, d := range decls {
-		if d.Editable {
-			byFile[d.File] = append(byFile[d.File], d.Line)
-		}
+	backups, err := rewriteDeclarations(decls)
+	out := map[string][]byte{}
+	for _, b := range backups {
+		out[b.Path] = b.Data
 	}
-	for f, lineNos := range byFile {
-		real, err := filepath.EvalSymlinks(f)
-		if err != nil {
-			return backup, err
+	return out, err
+}
+
+// rewriteDeclarations removes the editable declarations, editing each real
+// file once. Every file is checked before any is written: the recorded lines
+// must still be there, and the result must still be TOML without the key. If
+// a write fails, the files already rewritten are restored. It returns the
+// original contents in the order the files were written.
+func rewriteDeclarations(decls []declaration) ([]configBackup, error) {
+	var order []string
+	byReal := map[string][]declaration{}
+	for _, d := range decls {
+		if !d.Editable {
+			continue
 		}
+		real, err := filepath.EvalSymlinks(d.File)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := byReal[real]; !ok {
+			order = append(order, real)
+		}
+		byReal[real] = append(byReal[real], d)
+	}
+	var backups []configBackup
+	var contents [][]byte
+	for _, real := range order {
 		fi, err := os.Stat(real)
 		if err != nil {
-			return backup, err
+			return nil, err
 		}
 		data, err := os.ReadFile(real)
 		if err != nil {
-			return backup, err
+			return nil, err
 		}
-		backup[real] = data
 		lines := strings.Split(string(data), "\n")
 		drop := map[int]bool{}
-		for _, n := range lineNos {
-			drop[n] = true
+		keys := map[string]bool{}
+		for _, d := range byReal[real] {
+			end := d.lineEnd()
+			if d.Line < 0 || end > len(lines) || strings.Join(lines[d.Line:end], "\n") != d.Text {
+				return nil, fmt.Errorf("%s changed while editing it (line %d is no longer %q); not editing it", tildify(d.File), d.Line+1, strings.TrimSpace(d.Text))
+			}
+			for n := d.Line; n < end; n++ {
+				drop[n] = true
+			}
+			if d.Key != "" {
+				keys[d.Key] = true
+			}
 		}
 		var kept []string
 		for i, l := range lines {
@@ -296,38 +489,104 @@ func removeDeclarationsBackup(decls []declaration) (map[string][]byte, error) {
 				kept = append(kept, l)
 			}
 		}
-		tmp := real + ".mise-brew.tmp"
-		if err := os.WriteFile(tmp, []byte(strings.Join(kept, "\n")), fi.Mode().Perm()); err != nil {
-			return backup, err
+		edited := []byte(strings.Join(kept, "\n"))
+		if err := checkEditedTOML(data, edited, keys); err != nil {
+			return nil, fmt.Errorf("%s: %v; not editing it", tildify(real), err)
 		}
-		if err := os.Rename(tmp, real); err != nil {
-			_ = os.Remove(tmp)
-			return backup, err
+		backups = append(backups, configBackup{real, data, fi.Mode().Perm()})
+		contents = append(contents, edited)
+	}
+	for i, b := range backups {
+		if err := writeConfigAtomic(b.Path, contents[i], b.Mode); err != nil {
+			restoreConfigs(backups[:i], nil)
+			return nil, err
 		}
 	}
-	return backup, nil
+	return backups, nil
+}
+
+// checkEditedTOML is a safety net for the line-based edit: when the original
+// parses, the edited content must parse too and no longer declare keys.
+func checkEditedTOML(orig, edited []byte, keys map[string]bool) error {
+	var m map[string]any
+	if _, err := toml.Decode(string(orig), &m); err != nil {
+		return nil // nothing to compare against
+	}
+	m = nil
+	if _, err := toml.Decode(string(edited), &m); err != nil {
+		return fmt.Errorf("the edit would leave invalid TOML (%v)", err)
+	}
+	b, _ := m["bootstrap"].(map[string]any)
+	pkgs, _ := b["packages"].(map[string]any)
+	for k := range keys {
+		if _, ok := pkgs[k]; ok {
+			return fmt.Errorf("%s would still be declared", k)
+		}
+	}
+	return nil
+}
+
+// writeConfigAtomic replaces path with data via a fresh temp file in the same
+// directory (never following a planted symlink), keeping mode.
+func writeConfigAtomic(path string, data []byte, mode os.FileMode) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".mise-brew-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Chmod(mode)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, path)
+	}
+	if err != nil {
+		_ = os.Remove(tmp)
+	}
+	return err
+}
+
+// restoreConfigs writes the backups back, most recent edit first.
+func restoreConfigs(backups []configBackup, restored func(path string)) {
+	for i := len(backups) - 1; i >= 0; i-- {
+		b := backups[i]
+		if err := writeConfigAtomic(b.Path, b.Data, b.Mode); err != nil {
+			onoe("could not restore %s: %v", tildify(b.Path), err)
+			continue
+		}
+		if restored != nil {
+			restored(b.Path)
+		}
+	}
 }
 
 // undeclare removes pkg from every config file and reports what it did.
-// It returns a function that puts the removed lines back.
+// It returns a function that puts the removed lines back; calling it again
+// does nothing.
 func undeclare(pkg string) (restore func()) {
 	restore = func() {}
 	decls := findDeclarations(pkg, configFiles())
 	if len(decls) == 0 {
 		return
 	}
-	backup, err := removeDeclarationsBackup(decls)
+	backups, err := rewriteDeclarations(decls)
 	if err != nil {
 		odie("could not edit mise config: %v", err)
 	}
+	var once sync.Once
 	restore = func() {
-		for f, data := range backup {
-			if err := os.WriteFile(f, data, 0o644); err != nil {
-				onoe("could not restore %s: %v", f, err)
-				continue
-			}
-			fmt.Printf("Restored %s in %s\n", pkg, tildify(f))
-		}
+		once.Do(func() {
+			restoreConfigs(backups, func(f string) {
+				fmt.Printf("Restored %s in %s\n", pkg, tildify(f))
+			})
+		})
 	}
 	for _, d := range decls {
 		if d.Editable {
