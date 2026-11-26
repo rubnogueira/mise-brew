@@ -81,6 +81,52 @@ func (s *service) installedPath() string {
 	return filepath.Join(installDir(), s.Label+ext)
 }
 
+// sourceTimer is the systemd timer shipped next to the unit ("" on macOS or
+// when the service isn't timed).
+func (s *service) sourceTimer() string {
+	if runtime.GOOS == "darwin" {
+		return ""
+	}
+	if t := strings.TrimSuffix(s.Source, ".service") + ".timer"; fileExists(t) {
+		return t
+	}
+	return ""
+}
+
+// installedTimer is the registered systemd timer, if one was installed.
+func (s *service) installedTimer() string {
+	if runtime.GOOS == "darwin" {
+		return ""
+	}
+	if t := strings.TrimSuffix(s.installedPath(), ".service") + ".timer"; fileExists(t) {
+		return t
+	}
+	return ""
+}
+
+// timed reports whether the service runs on a schedule (Homebrew's timed?).
+func (s *service) timed() bool {
+	if runtime.GOOS != "darwin" {
+		return s.sourceTimer() != ""
+	}
+	data, err := os.ReadFile(s.Source)
+	if err != nil {
+		return false
+	}
+	txt := string(data)
+	return strings.Contains(txt, "<key>StartInterval</key>") || strings.Contains(txt, "<key>StartCalendarInterval</key>")
+}
+
+// units lists the systemd units to act on when stopping: the service and,
+// when one was registered, its timer.
+func (s *service) units() []string {
+	u := []string{s.Label}
+	if s.installedTimer() != "" {
+		u = append(u, s.Label+".timer")
+	}
+	return u
+}
+
 type serviceState struct {
 	Loaded   bool
 	Running  bool
@@ -113,10 +159,35 @@ func (s *service) state() serviceState {
 		}
 		return st
 	}
-	args := systemctlArgs("show", s.Label, "--property=ActiveState,MainPID,ExecMainStatus,LoadState")
+	props := systemctlShow(s.Label)
+	if props == nil {
+		return st
+	}
+	st.Loaded = props["LoadState"] == "loaded" && props["ActiveState"] != "inactive"
+	st.Running = props["ActiveState"] == "active"
+	st.PID, _ = strconv.Atoi(props["MainPID"])
+	if s.installedTimer() != "" {
+		// A timed service stays loaded while its timer is active, even after
+		// the service itself finished (Homebrew queries <label>.timer too).
+		if tp := systemctlShow(s.Label + ".timer"); tp != nil && tp["ActiveState"] == "active" {
+			st.Loaded = true
+		}
+	}
+	if st.Loaded && !st.Running {
+		c, err := strconv.Atoi(props["ExecMainStatus"])
+		if err != nil {
+			c = 0
+		}
+		st.ExitCode = &c
+	}
+	return st
+}
+
+func systemctlShow(unit string) map[string]string {
+	args := systemctlArgs("show", unit, "--property=ActiveState,MainPID,ExecMainStatus,LoadState")
 	out, err := exec.Command("systemctl", args...).Output()
 	if err != nil {
-		return st
+		return nil
 	}
 	props := map[string]string{}
 	for _, l := range strings.Split(string(out), "\n") {
@@ -124,13 +195,7 @@ func (s *service) state() serviceState {
 			props[k] = v
 		}
 	}
-	st.Loaded = props["LoadState"] == "loaded" && props["ActiveState"] != "inactive"
-	st.Running = props["ActiveState"] == "active"
-	st.PID, _ = strconv.Atoi(props["MainPID"])
-	if c, err := strconv.Atoi(props["ExecMainStatus"]); err == nil && props["ActiveState"] == "failed" {
-		st.ExitCode = &c
-	}
-	return st
+	return props
 }
 
 func systemctlArgs(args ...string) []string {
@@ -142,17 +207,31 @@ func systemctlArgs(args ...string) []string {
 
 func (s *service) status() (string, *int) {
 	st := s.state()
-	switch {
-	case st.Running:
-		return "started", nil
-	case st.Loaded && st.ExitCode != nil && *st.ExitCode != 0:
-		return "error", st.ExitCode
-	case st.Loaded:
-		return "scheduled", nil
-	case fileExists(s.installedPath()):
-		return "stopped", nil
+	status := serviceStatus(st, s.timed())
+	if status == "error" {
+		return status, st.ExitCode
 	}
-	return "none", nil
+	return status, nil
+}
+
+// serviceStatus mirrors Homebrew's Services::FormulaWrapper#to_hash: a loaded
+// service that exited cleanly is "stopped" ("scheduled" when timed), one that
+// isn't loaded is "none" even if its file is registered.
+func serviceStatus(st serviceState, timed bool) string {
+	switch {
+	case st.Running || st.PID > 0:
+		return "started"
+	case !st.Loaded:
+		return "none"
+	case st.ExitCode != nil && *st.ExitCode == 0:
+		if timed {
+			return "scheduled"
+		}
+		return "stopped"
+	case st.ExitCode != nil:
+		return "error"
+	}
+	return "other"
 }
 
 func currentUser() string {
@@ -209,8 +288,10 @@ func cmdServices(args []string) {
 			serviceRun(s)
 		}
 	case "start", "launch", "load", "s":
+		file, _ := o.Val("file")
+		user, _ := o.Val("sudo-service-user")
 		for _, s := range targets() {
-			serviceStart(s, o)
+			serviceStart(s, file, user)
 		}
 	case "stop", "unload", "terminate", "term", "t", "u":
 		for _, s := range targets() {
@@ -221,9 +302,11 @@ func cmdServices(args []string) {
 			serviceKill(s)
 		}
 	case "restart", "relaunch", "reload", "r":
+		file, _ := o.Val("file")
+		user, _ := o.Val("sudo-service-user")
 		for _, s := range targets() {
 			serviceStop(s, false)
-			serviceStart(s, o)
+			serviceStart(s, file, user)
 		}
 	case "cleanup", "clean", "cl", "rm":
 		servicesCleanup()
@@ -241,7 +324,7 @@ func servicesList(asJSON bool) {
 		File     *string `json:"file"`
 		ExitCode *int    `json:"exit_code"`
 	}
-	var rows []row
+	rows := []row{}
 	for _, s := range svcs {
 		st, code := s.status()
 		r := row{Name: s.Formula, Status: st, ExitCode: code}
@@ -255,9 +338,6 @@ func servicesList(asJSON bool) {
 		rows = append(rows, r)
 	}
 	if asJSON {
-		if rows == nil {
-			rows = []row{}
-		}
 		printJSON(rows)
 		return
 	}
@@ -307,12 +387,12 @@ func servicesInfo(svcs []*service, asJSON bool) {
 		File        string `json:"file"`
 		Registered  bool   `json:"registered"`
 	}
-	var out []info
+	out := []info{}
 	for _, s := range svcs {
 		st := s.state()
-		status, _ := s.status()
-		i := info{Name: s.Formula, Label: s.Label, Running: st.Running, Loaded: st.Loaded, ExitCode: st.ExitCode,
-			User: currentUser(), Status: status, File: s.Source, Registered: fileExists(s.installedPath())}
+		timed := s.timed()
+		i := info{Name: s.Formula, Label: s.Label, Running: st.Running, Loaded: st.Loaded, Schedulable: timed, ExitCode: st.ExitCode,
+			User: currentUser(), Status: serviceStatus(st, timed), File: s.Source, Registered: fileExists(s.installedPath())}
 		if st.PID > 0 {
 			p := st.PID
 			i.PID = &p
@@ -333,7 +413,7 @@ func servicesInfo(svcs []*service, asJSON bool) {
 		fmt.Printf("%s (%s)\n", bold(i.Name), i.Label)
 		fmt.Printf("Running: %s\n", yesNo(i.Running))
 		fmt.Printf("Loaded: %s\n", yesNo(i.Loaded))
-		fmt.Printf("Schedulable: %s\n", yesNo(false))
+		fmt.Printf("Schedulable: %s\n", yesNo(i.Schedulable))
 		if i.PID != nil {
 			fmt.Printf("PID: %d\n", *i.PID)
 		}
@@ -380,23 +460,25 @@ func runQuiet(name string, args ...string) error {
 	return cmd.Run()
 }
 
-func serviceStart(s *service, o Opts) {
+// serviceStart registers and starts s. file replaces the formula's service
+// file (`brew services start --file=`); sudoUser is --sudo-service-user.
+func serviceStart(s *service, file, sudoUser string) {
 	src := s.Source
-	if f, ok := o.Val("file"); ok && f != "" {
-		src = f
+	if file != "" {
+		src = file
 	}
 	if st := s.state(); st.Running {
 		fmt.Printf("Service `%s` already started, use `brew services restart %s` to restart.\n", s.Formula, s.Formula)
 		return
 	}
+	if sudoUser != "" && !isRoot() {
+		odie("--sudo-service-user requires running as root (sudo brew services ...).")
+	}
 	dst := s.installedPath()
 	if err := copyFile(src, dst); err != nil {
 		odie("could not install %s: %v", dst, err)
 	}
-	if u, ok := o.Val("sudo-service-user"); ok && u != "" {
-		if !isRoot() {
-			odie("--sudo-service-user requires running as root (sudo brew services ...).")
-		}
+	if u := sudoUser; u != "" {
 		if runtime.GOOS == "darwin" {
 			data, _ := os.ReadFile(dst)
 			txt := string(data)
@@ -412,7 +494,7 @@ func serviceStart(s *service, o Opts) {
 	}
 	unit := s.Label
 	if runtime.GOOS != "darwin" {
-		if timer := strings.TrimSuffix(s.Source, ".service") + ".timer"; fileExists(timer) {
+		if timer := s.sourceTimer(); timer != "" {
 			tdst := strings.TrimSuffix(dst, ".service") + ".timer"
 			if err := copyFile(timer, tdst); err != nil {
 				odie("%v", err)
@@ -485,15 +567,11 @@ func serviceStop(s *service, keep bool) {
 			_ = runQuiet("launchctl", "bootout", launchDomain()+"/"+s.Label)
 		}
 	} else {
-		verb := "stop"
+		a := []string{"stop"}
 		if !keep {
-			verb = "disable"
+			a = []string{"disable", "--now"}
 		}
-		a := []string{verb}
-		if !keep {
-			a = append(a, "--now")
-		}
-		_ = runQuiet("systemctl", systemctlArgs(append(a, s.Label)...)...)
+		_ = runQuiet("systemctl", systemctlArgs(append(a, s.units()...)...)...)
 	}
 	waitStopped(s)
 	if !keep {
@@ -515,6 +593,10 @@ func serviceKill(s *service) {
 	if runtime.GOOS == "darwin" {
 		err = runQuiet("launchctl", "kill", "SIGTERM", launchDomain()+"/"+s.Label)
 	} else {
+		if s.installedTimer() != "" {
+			// Keep the timer from triggering the service again.
+			_ = runQuiet("systemctl", systemctlArgs("stop", s.Label+".timer")...)
+		}
 		err = runQuiet("systemctl", systemctlArgs("kill", s.Label)...)
 	}
 	if err != nil {
@@ -523,30 +605,57 @@ func serviceKill(s *service) {
 	oh1("Successfully killed `%s` (label: %s)", s.Formula, s.Label)
 }
 
+// serviceFileFormula parses a registered service file name such as
+// homebrew.mxcl.foo.plist or homebrew.foo.timer into the unit to stop (the
+// launchd label, or the systemd unit name) and the formula. Only Homebrew's
+// labels with the platform's extensions qualify.
+func serviceFileFormula(name, goos string) (unit, formula string, ok bool) {
+	exts := []string{".service", ".timer"}
+	if goos == "darwin" {
+		exts = []string{".plist"}
+	}
+	label := ""
+	for _, ext := range exts {
+		if strings.HasSuffix(name, ext) {
+			label, unit = strings.TrimSuffix(name, ext), name
+			if ext == ".plist" {
+				unit = label
+			}
+			break
+		}
+	}
+	for _, p := range []string{"sh.brew.", "homebrew.mxcl.", "homebrew."} {
+		if label != "" && strings.HasPrefix(label, p) && len(label) > len(p) {
+			return unit, strings.TrimPrefix(label, p), true
+		}
+	}
+	return "", "", false
+}
+
 // servicesCleanup removes registered service files whose formula is gone.
 func servicesCleanup() {
 	entries, _ := os.ReadDir(installDir())
 	var removed []string
+	seen := map[string]bool{}
 	for _, e := range entries {
 		n := e.Name()
-		var label, formula string
-		for _, p := range []string{"sh.brew.", "homebrew.mxcl.", "homebrew."} {
-			if strings.HasPrefix(n, p) {
-				label = strings.TrimSuffix(strings.TrimSuffix(n, ".plist"), ".service")
-				formula = strings.TrimPrefix(label, p)
-				break
-			}
-		}
-		if label == "" || isFormulaInstalled(formula) {
+		unit, formula, ok := serviceFileFormula(n, runtime.GOOS)
+		if !ok || isFormulaInstalled(formula) {
 			continue
 		}
 		if runtime.GOOS == "darwin" {
-			_ = runQuiet("launchctl", "bootout", launchDomain()+"/"+label)
+			_ = runQuiet("launchctl", "bootout", launchDomain()+"/"+unit)
 		} else {
-			_ = runQuiet("systemctl", systemctlArgs("disable", "--now", label)...)
+			_ = runQuiet("systemctl", systemctlArgs("disable", "--now", unit)...)
 		}
 		_ = os.Remove(filepath.Join(installDir(), n))
-		removed = append(removed, formula)
+		if !seen[formula] {
+			seen[formula] = true
+			removed = append(removed, formula)
+		}
+	}
+	if runtime.GOOS != "darwin" && len(removed) > 0 {
+		_ = runQuiet("systemctl", systemctlArgs("daemon-reload")...)
 	}
 	sort.Strings(removed)
 	if len(removed) == 0 {

@@ -18,12 +18,27 @@ import (
 const shimScript = `#!/bin/bash
 # mise-brew superenv shim (see brew --env)
 name="${0##*/}"
+dir="${0%/*}"
+# Drop this directory from PATH so neither the lookups below nor the real
+# compiler's own sub-invocations can find the shims again.
+IFS=: read -ra parts <<< "${PATH:-}"
+PATH=""
+for p in "${parts[@]}"; do
+  [ -n "$p" ] && [ "$p" -ef "$dir" ] && continue
+  PATH="${PATH:+$PATH:}$p"
+done
+export PATH
 case "$name" in
-  c++|g++|clang++|*++*) real="${HOMEBREW_CXX_REAL:-}" ; [ -n "$real" ] || real="$(xcrun -f clang++ 2>/dev/null || command -v g++ || echo /usr/bin/c++)" ;;
-  cpp) real="${HOMEBREW_CPP_REAL:-/usr/bin/cpp}" ;;
-  ld) real="${HOMEBREW_LD_REAL:-/usr/bin/ld}" ;;
-  *) real="${HOMEBREW_CC_REAL:-}" ; [ -n "$real" ] || real="$(xcrun -f clang 2>/dev/null || command -v gcc || echo /usr/bin/cc)" ;;
+  c++|g++|clang++) var=CXX ; real="${HOMEBREW_CXX_REAL:-}" ; [ -n "$real" ] || real="$(xcrun -f clang++ 2>/dev/null || command -v g++ || command -v c++)" ;;
+  cpp) var=CPP ; real="${HOMEBREW_CPP_REAL:-}" ; [ -n "$real" ] || real="$(command -v cpp)" ;;
+  ld) var=LD ; real="${HOMEBREW_LD_REAL:-}" ; [ -n "$real" ] || real="$(command -v ld)" ;;
+  *) var=CC ; real="${HOMEBREW_CC_REAL:-}" ; [ -n "$real" ] || real="$(xcrun -f clang 2>/dev/null || command -v gcc || command -v cc)" ;;
 esac
+case "$real" in */*) ;; ?*) real="$(command -v "$real")" ;; esac
+if [ -z "$real" ] || [ "${real%/*}" -ef "$dir" ]; then
+  echo "mise-brew superenv: cannot find the real compiler for '$name' (set HOMEBREW_${var}_REAL)" >&2
+  exit 1
+fi
 extra=()
 if [ "$name" != "ld" ]; then
   IFS=: read -ra inc <<< "${HOMEBREW_ISYSTEM_PATHS:-}"
@@ -39,19 +54,96 @@ exec "$real" "$@" "${extra[@]}"
 
 func shimsDir() string { return filepath.Join(miseBrewCacheDir(), "shims", "super") }
 
+// shimNames are the only shims that exist; any other requested compiler is
+// reached through cc/c++ with HOMEBREW_CC_REAL/HOMEBREW_CXX_REAL.
+var shimNames = []string{"cc", "c++", "clang", "clang++", "gcc", "g++", "cpp", "ld"}
+
 func ensureShims() string {
 	dir := shimsDir()
-	names := []string{"cc", "c++", "clang", "clang++", "gcc", "g++", "cpp", "ld"}
 	if fileExists(filepath.Join(dir, "cc")) {
 		if b, err := os.ReadFile(filepath.Join(dir, "cc")); err == nil && string(b) == shimScript {
 			return dir
 		}
 	}
 	_ = os.MkdirAll(dir, 0o755)
-	for _, n := range names {
+	for _, n := range shimNames {
 		_ = os.WriteFile(filepath.Join(dir, n), []byte(shimScript), 0o755)
 	}
 	return dir
+}
+
+// shimFor returns the shim that stands in for compiler: its own shim when one
+// exists, else the generic cc (or c++).
+func shimFor(compiler string, cxx bool) string {
+	if contains(shimNames, compiler) {
+		return compiler
+	}
+	if cxx {
+		return "c++"
+	}
+	return "cc"
+}
+
+// cxxFor maps a C compiler to its C++ counterpart: gcc-14 → g++-14,
+// clang → clang++, clang-17 → clang++-17, cc → c++.
+func cxxFor(cc string) string {
+	dir, base := filepath.Split(cc)
+	switch {
+	case base == "llvm_clang":
+		return base
+	case strings.Contains(base, "clang"):
+		i := strings.LastIndex(base, "clang") + len("clang")
+		return dir + base[:i] + "++" + base[i:]
+	case strings.Contains(base, "gcc"):
+		i := strings.LastIndex(base, "gcc")
+		return dir + base[:i] + "g++" + base[i+len("gcc"):]
+	case base == "cc":
+		return dir + "c++"
+	}
+	return "c++"
+}
+
+// lookPathExcluding finds name on path, skipping the shims directory.
+func lookPathExcluding(name, path, exclude string) string {
+	ex, _ := filepath.EvalSymlinks(exclude)
+	for _, d := range filepath.SplitList(path) {
+		if d == "" || filepath.Clean(d) == filepath.Clean(exclude) {
+			continue
+		}
+		if r, err := filepath.EvalSymlinks(d); err == nil && ex != "" && r == ex {
+			continue
+		}
+		p := filepath.Join(d, name)
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
+			return p
+		}
+	}
+	return ""
+}
+
+// realTool resolves the compiler a shim should exec, never the shim itself.
+// HOMEBREW_CC=llvm_clang means Homebrew's llvm, as in Homebrew.
+func realTool(name, path, shims string) string {
+	if name == "llvm_clang" {
+		name = filepath.Join(optDir(), "llvm", "bin", "clang")
+	}
+	if filepath.IsAbs(name) {
+		if fi, err := os.Stat(name); err == nil && !fi.IsDir() && filepath.Dir(name) != filepath.Clean(shims) {
+			return name
+		}
+		return ""
+	}
+	if p := lookPathExcluding(name, path, shims); p != "" {
+		return p
+	}
+	if runtime.GOOS == "darwin" {
+		if out, err := exec.Command("xcrun", "--find", name).Output(); err == nil {
+			if p := strings.TrimSpace(string(out)); p != "" && filepath.Dir(p) != filepath.Clean(shims) {
+				return p
+			}
+		}
+	}
+	return ""
 }
 
 func sdkRoot() string {
@@ -105,12 +197,16 @@ func buildEnv(formulae []string, std bool) [][2]string {
 		}
 		cmake = append(cmake, root)
 	}
-	cc, cxx := "clang", "clang++"
+	cc := "clang"
 	if runtime.GOOS == "linux" {
-		cc, cxx = "gcc", "g++"
+		cc = "gcc"
 	}
 	if v := os.Getenv("HOMEBREW_CC"); v != "" {
 		cc = v
+	}
+	cxx := cxxFor(cc)
+	if cc == "llvm_clang" && std {
+		cc, cxx = filepath.Join(optDir(), "llvm", "bin", "clang"), filepath.Join(optDir(), "llvm", "bin", "clang++")
 	}
 	jobs := strconv.Itoa(runtime.NumCPU())
 	if v := os.Getenv("HOMEBREW_MAKE_JOBS"); v != "" {
@@ -152,9 +248,22 @@ func buildEnv(formulae []string, std bool) [][2]string {
 		return env
 	}
 	shims := ensureShims()
+	// Resolve the real tools here, with the shims off PATH, so a shim never
+	// finds itself (or another shim) as its compiler.
+	searchPath := filepath.Join(p, "bin") + ":" + filepath.Join(p, "sbin") + ":" + sysPath + ":" + os.Getenv("PATH")
+	realCXX := cxx
+	if cc == "llvm_clang" {
+		realCXX = filepath.Join(optDir(), "llvm", "bin", "clang++")
+	}
+	for _, t := range [][2]string{{"HOMEBREW_CC_REAL", cc}, {"HOMEBREW_CXX_REAL", realCXX}, {"HOMEBREW_CPP_REAL", "cpp"}, {"HOMEBREW_LD_REAL", "ld"}} {
+		if r := realTool(t[1], searchPath, shims); r != "" {
+			env = append(env, [2]string{t[0], r})
+		}
+	}
+	ccShim, cxxShim := shimFor(cc, false), shimFor(cxx, true)
 	return append(env,
-		[2]string{"CC", filepath.Join(shims, cc)}, [2]string{"CXX", filepath.Join(shims, cxx)},
-		[2]string{"OBJC", filepath.Join(shims, cc)}, [2]string{"OBJCXX", filepath.Join(shims, cxx)},
+		[2]string{"CC", filepath.Join(shims, ccShim)}, [2]string{"CXX", filepath.Join(shims, cxxShim)},
+		[2]string{"OBJC", filepath.Join(shims, ccShim)}, [2]string{"OBJCXX", filepath.Join(shims, cxxShim)},
 		[2]string{"HOMEBREW_ISYSTEM_PATHS", strings.Join(inc, ":")},
 		[2]string{"HOMEBREW_LIBRARY_PATHS", strings.Join(lib, ":")},
 		[2]string{"HOMEBREW_OPTIMIZATION_LEVEL", "Os"},
@@ -208,7 +317,7 @@ func cmdSh(args []string) {
 		zdot := filepath.Join(miseBrewCacheDir(), "zdotdir")
 		_ = os.MkdirAll(zdot, 0o755)
 		_ = os.WriteFile(filepath.Join(zdot, ".zshrc"), []byte("PROMPT='brew %~%# '\n"), 0o644)
-		env = append(env, "ZDOTDIR="+zdot)
+		env = mergeEnv(env, [][2]string{{"ZDOTDIR", zdot}})
 	case "bash":
 		argv = append(argv, "--norc", "--noprofile")
 	}
