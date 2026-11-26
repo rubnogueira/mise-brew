@@ -419,3 +419,32 @@ func TestRuntimeDepRevision(t *testing.T) { // finding 9
 		t.Errorf("runtime_dependencies revision not derived from pkg_version: %s", out)
 	}
 }
+
+func TestConfiguredTapsFromFilesTOMLForms(t *testing.T) {
+	isolateMise(t, "")
+	cfg := filepath.Join(t.TempDir(), "mise.toml")
+	write(t, cfg, `[bootstrap.brew.taps]
+"Acme/Tools" = "https://github.com/acme/homebrew-tools"
+"x/y" = { url = "https://github.com/x/homebrew-y" }
+
+[[tasks.build.steps]]
+"bootstrap.brew.taps.evil/one" = "not a tap"
+
+[env]
+NOTE = """
+[bootstrap.brew.taps]
+"evil/two" = "inside a string"
+"""
+`)
+	t.Setenv("MISEBREW_CONFIG", cfg)
+	got := configuredTapsFromFiles()
+	if got["acme/tools"] != "https://github.com/acme/homebrew-tools" || got["x/y"] != "https://github.com/x/homebrew-y" {
+		t.Errorf("taps = %v", got)
+	}
+	if _, ok := got["evil/one"]; ok {
+		t.Errorf("array-of-tables key read as tap: %v", got)
+	}
+	if _, ok := got["evil/two"]; ok {
+		t.Errorf("multi-line string read as tap: %v", got)
+	}
+}

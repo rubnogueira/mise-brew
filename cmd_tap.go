@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/BurntSushi/toml"
 	"os"
 	"sort"
 	"strings"
@@ -16,24 +17,25 @@ func configuredTapsFromFiles() map[string]string {
 		if err != nil {
 			continue
 		}
-		table := ""
-		for _, line := range strings.Split(string(data), "\n") {
-			if m := tableHeaderRe.FindStringSubmatch(line); m != nil {
-				table = normalizeTOMLKey(m[1])
-				continue
+		// Read-only, so use a real TOML parser: it handles every table form,
+		// arrays of tables and multi-line values.
+		var doc map[string]any
+		if _, err := toml.Decode(string(data), &doc); err != nil {
+			odebug("skipping taps in %s: %v", f, err)
+			continue
+		}
+		bootstrap, _ := doc["bootstrap"].(map[string]any)
+		brew, _ := bootstrap["brew"].(map[string]any)
+		configured, _ := brew["taps"].(map[string]any)
+		for tap, v := range configured {
+			url := ""
+			switch v := v.(type) {
+			case string:
+				url = v
+			case map[string]any:
+				url, _ = v["url"].(string)
 			}
-			key, val, ok := keyOfLine(line)
-			if !ok {
-				continue
-			}
-			full := key
-			if table != "" {
-				full = table + "." + key
-			}
-			if strings.HasPrefix(full, "bootstrap.brew.taps.") {
-				tap := strings.TrimPrefix(full, "bootstrap.brew.taps.")
-				taps[strings.ToLower(tap)] = strings.Trim(strings.TrimSpace(stripComment(val)), `"'`)
-			}
+			taps[strings.ToLower(tap)] = url
 		}
 	}
 	return taps
