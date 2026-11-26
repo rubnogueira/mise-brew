@@ -1,7 +1,7 @@
 name: Release
 
 # Publishes a GitHub release with prebuilt binaries when a version tag is pushed:
-#   git tag v0.1.0 && git push origin v0.1.0
+#   git tag v0.2.0 && git push origin v0.2.0
 on:
   push:
     tags: ["v*"]
@@ -19,7 +19,7 @@ jobs:
       - name: Test
         run: |
           go vet ./...
-          mise run test
+          go test ./...
 
       - name: Build
         env:
@@ -29,16 +29,22 @@ jobs:
           mkdir -p dist
           for target in darwin/arm64 darwin/amd64 linux/arm64 linux/amd64; do
             os="${target%/*}" arch="${target#*/}"
-            name="mise-brew-${version}-${os}-${arch}"
+            # Version-less names so releases/latest/download/<name> stays stable.
+            name="mise-brew-${os}-${arch}"
             mkdir -p "build/$name"
             GOOS="$os" GOARCH="$arch" go build -trimpath \
-              -ldflags "-s -w -X main.miseBrewVersion=${version}" \
-              -o "build/$name/brew" .
-            cp README.md "build/$name/"
+              -ldflags "-s -w -X github.com/rubnogueira/mise-brew/internal/buildinfo.Version=${version}" \
+              -o "build/$name/brew" ./cmd/brew
+            cp README.md LICENSE "build/$name/"
             tar -C build -czf "dist/$name.tar.gz" "$name"
           done
           (cd dist && shasum -a 256 *.tar.gz > checksums.txt)
           cat dist/checksums.txt
+
+      - name: Check the stamped version
+        run: |
+          tar -xzf dist/mise-brew-darwin-arm64.tar.gz -C build
+          build/mise-brew-darwin-arm64/brew --version | grep -F "mise-brew ${GITHUB_REF_NAME#v} "
 
       - name: Publish release
         env:

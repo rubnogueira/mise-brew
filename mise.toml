@@ -3,14 +3,14 @@ go = "1.27"
 
 [tasks.build]
 description = "Build bin/brew"
-run = "go build -trimpath -ldflags='-s -w' -o bin/brew ."
+run = "go build -trimpath -ldflags='-s -w' -o bin/brew ./cmd/brew"
 
 [tasks.test]
-description = "Run the unit tests"
-run = "go test ./..."
+description = "Vet and run the unit tests"
+run = "go vet ./... && go test ./..."
 
 [tasks.install]
-description = "Install bin/brew as $PREFIX/bin/brew (default /opt/homebrew)"
+description = "Install bin/brew as $PREFIX/bin/brew (default: the Homebrew prefix)"
 depends = ["build"]
 run = '''
 prefix="${PREFIX:-$(./bin/brew --prefix)}"
