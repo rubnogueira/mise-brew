@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,10 +26,14 @@ func (r pkgRef) key() string {
 
 // resolvePackage resolves a user-supplied name for installing.
 func resolvePackage(name string, o Opts) pkgRef {
+	if !validPackageArg(name) {
+		onoe("No available formula or cask with the name \"%s\".", name)
+		exit(1)
+	}
 	n := stripCoreTap(name)
 	lower := strings.ToLower(n)
 	if strings.HasPrefix(name, "homebrew/cask/") || strings.HasPrefix(name, "homebrew/homebrew-cask/") {
-		o.flags["cask"] = ""
+		o = o.withFlag("cask", "") // only for this name, not the rest of the command line
 	}
 	if isThirdPartyTapName(n) {
 		if !o.onlyCask() {
@@ -320,12 +325,32 @@ func splitBottleName(file string, installed map[string]string) (string, string) 
 
 // --- pin / link / tab -------------------------------------------------------
 
+// validPackageArg reports whether a user-supplied formula/cask name (after
+// removing homebrew/core|cask/) is a plain name or owner/tap/name whose every
+// segment is safe to join onto the Cellar or Caskroom. ".", ".." and
+// "../var" are rejected.
+func validPackageArg(name string) bool {
+	n := stripCoreTap(name)
+	if isThirdPartyTapName(n) {
+		for _, part := range strings.Split(n, "/") {
+			if !validName(part) {
+				return false
+			}
+		}
+		return true
+	}
+	return validName(n)
+}
+
 func requireInstalled(names []string) []string {
 	if len(names) == 0 {
 		odie("Invalid usage: This command requires at least 1 installed formula argument.")
 	}
 	var out []string
 	for _, n := range names {
+		if !validPackageArg(n) {
+			odie("No such keg: %s", cellar()+"/"+n)
+		}
 		r := resolveInstalledFormula(n)
 		if r == "" {
 			odie("No such keg: %s", filepath.Join(cellar(), n))
@@ -378,13 +403,19 @@ func cmdLink(args []string) {
 			continue
 		}
 		if dry {
+			// Like Homebrew: list every file that would be linked, or with
+			// --overwrite every existing file that would be deleted.
 			if o.Has("overwrite") {
 				fmt.Println("Would remove:")
 			} else {
-				fmt.Printf("Would link:\n")
+				fmt.Println("Would link:")
 			}
+			for _, l := range linkDryRun(n, v, o.Has("overwrite")) {
+				fmt.Println(l)
+			}
+			continue
 		}
-		count, conflicts, err := linkKeg(n, v, o.Has("overwrite"), dry)
+		count, conflicts, err := linkKeg(n, v, o.Has("overwrite"), false)
 		if err != nil {
 			odie("%v", err)
 		}
@@ -394,10 +425,55 @@ func cmdLink(args []string) {
 			onoe("Could not symlink %s\nTarget %s\nalready exists. You may want to remove it:\n  rm '%s'\n\nTo force the link and overwrite all conflicting files:\n  brew link --overwrite %s\n\nTo list all files that would be deleted:\n  brew link --overwrite %s --dry-run", c.rel, c.dst, c.dst, n, n)
 			exit(1)
 		}
-		if !dry {
-			fmt.Printf("Linking %s... %s created.\n", keg, plural(count, "symlink"))
-		}
+		fmt.Printf("Linking %s... %s created.\n", keg, plural(count, "symlink"))
 	}
+}
+
+// linkDryRun lists what `brew link --dry-run` prints: each prefix path that
+// would be linked, or (overwrite) each existing path that would be replaced,
+// shown as "dst -> target" for symlinks. Paths already linked to the keg are
+// skipped, as linkKeg does.
+func linkDryRun(name, version string, overwrite bool) []string {
+	keg := kegPath(name, version)
+	roots := kegRoots(name, version)
+	var out []string
+	for _, top := range linkableDirs {
+		base := filepath.Join(keg, top)
+		if !isDir(base) {
+			continue
+		}
+		_ = filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			rel, _ := filepath.Rel(keg, p)
+			if skipLinkFiles[rel] || d.Name() == ".DS_Store" {
+				return nil
+			}
+			dst := filepath.Join(brewPrefix(), rel)
+			fi, err := os.Lstat(dst)
+			switch {
+			case err != nil:
+				if !overwrite {
+					out = append(out, dst)
+				}
+			case fi.Mode()&os.ModeSymlink != 0 && resolvesIntoAny(dst, roots):
+				// already linked
+			case !overwrite:
+				out = append(out, dst)
+			case fi.Mode()&os.ModeSymlink != 0:
+				t, _ := filepath.EvalSymlinks(dst)
+				if t == "" {
+					t, _ = os.Readlink(dst)
+				}
+				out = append(out, dst+" -> "+t)
+			default:
+				out = append(out, dst)
+			}
+			return nil
+		})
+	}
+	return out
 }
 
 func cmdUnlink(args []string) {
