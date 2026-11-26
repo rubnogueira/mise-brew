@@ -152,7 +152,7 @@ func cmdInstall(args []string) {
 		}
 		if o.Has("only-dependencies") && ref.f != nil {
 			for _, d := range recursiveDeps(ref.f, depFilter{}) {
-				if !isFormulaInstalled(d) {
+				if !isFormulaInstalled(baseName(d)) {
 					applyKeys = append(applyKeys, "brew:"+d)
 				}
 			}
@@ -792,7 +792,10 @@ func autoremoveCandidates() []string {
 	// that the installed keg's receipt predates (it is kept for the upgrade).
 	for n := range deps {
 		if f := lookupFormula(n); f != nil && f.Name == n {
-			deps[n] = dedupe(append(deps[n], directDeps(n, depFilter{})...))
+			for _, d := range directDeps(n, depFilter{}) {
+				deps[n] = append(deps[n], baseName(d))
+			}
+			deps[n] = dedupe(deps[n])
 		}
 	}
 	onRequest := func(n string) bool {

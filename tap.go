@@ -662,9 +662,10 @@ func validDepName(d string) bool {
 	return true
 }
 
-// safeVersion rejects versions that cannot be used in file names.
-func safeVersion(v string) string {
-	if strings.ContainsAny(v, `/\`) || strings.Contains(v, "..") {
+// sanitizeTapVersion drops versions from tap Ruby files that cannot be used
+// in file names (they end up in cache and unpack paths).
+func sanitizeTapVersion(v string) string {
+	if v == "" || !safeVersion(v) || strings.Contains(v, "..") {
 		return ""
 	}
 	return v
@@ -727,13 +728,13 @@ func parseTapFormula(src, tap, name, relPath string) *Formula {
 	}
 	f.Desc = get(rbDescRe)
 	f.Homepage = get(rbHomeRe)
-	f.Versions.Stable = safeVersion(get(rbVersionRe))
+	f.Versions.Stable = sanitizeTapVersion(get(rbVersionRe))
 	vars := map[string]string{"name": name}
 	f.URLs.Stable.URL = rbExpand(get(rbURLRe), f.Versions.Stable, vars)
 	f.URLs.Stable.Checksum = rbSHA256(spec)
 	f.Versions.Head = rbExpand(get(rbHeadRe), f.Versions.Stable, vars)
 	if f.Versions.Stable == "" {
-		f.Versions.Stable = safeVersion(versionFromURL(f.URLs.Stable.URL))
+		f.Versions.Stable = sanitizeTapVersion(versionFromURL(f.URLs.Stable.URL))
 	}
 	if m := rbRevRe.FindStringSubmatch(spec); m != nil {
 		f.Revision, _ = strconv.Atoi(m[1])
@@ -783,7 +784,7 @@ func parseTapCask(src, tap, token, relPath string) *Cask {
 		}
 		return ""
 	}
-	c.Version = safeVersion(get(rbVersionRe))
+	c.Version = sanitizeTapVersion(get(rbVersionRe))
 	if regexp.MustCompile(`(?m)^\s*version\s+:latest\b`).MatchString(spec) {
 		c.Version = "latest"
 	}

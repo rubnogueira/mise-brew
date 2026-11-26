@@ -36,6 +36,9 @@ func sourceFor(name string, o Opts) sourceRef {
 		if f := lookupFormula(name); f != nil && f.RubySourcePath != "" {
 			if f.Tap != "" && f.Tap != "homebrew/core" {
 				ow, rp := tapRepo(f.Tap)
+				if ow == "" {
+					odie("%s is from %s, which is not hosted on GitHub; its source is not available.", name, f.Tap)
+				}
 				return sourceRef{ow, rp, f.RubySourcePath, ""}
 			}
 			return sourceRef{"Homebrew", "homebrew-core", f.RubySourcePath, f.TapGitHead}
@@ -45,6 +48,9 @@ func sourceFor(name string, o Opts) sourceRef {
 		if c := lookupCask(name); c != nil && c.RubySourcePath != "" {
 			if c.Tap != "" && c.Tap != "homebrew/cask" {
 				ow, rp := tapRepo(c.Tap)
+				if ow == "" {
+					odie("%s is from %s, which is not hosted on GitHub; its source is not available.", name, c.Tap)
+				}
 				return sourceRef{ow, rp, c.RubySourcePath, ""}
 			}
 			return sourceRef{"Homebrew", "homebrew-cask", c.RubySourcePath, c.TapGitHead}
@@ -474,13 +480,10 @@ func caskSHA(c *Cask) string {
 		}
 		return ""
 	}
-	// Third-party tap casks: use the sha256 parsed from the Ruby file when the
-	// Cask carries one (as its "sha256" JSON field); never the core cask's.
-	var m map[string]any
-	if b, err := json.Marshal(c); err == nil && json.Unmarshal(b, &m) == nil {
-		if s, ok := m["sha256"].(string); ok {
-			return s
-		}
+	// Third-party tap casks: the sha256 parsed from the Ruby file, never the
+	// core cask's.
+	if c.SHA256 != "" {
+		return c.SHA256
 	}
 	return ""
 }
