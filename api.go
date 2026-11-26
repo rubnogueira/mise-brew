@@ -91,6 +91,7 @@ type Cask struct {
 	Homepage  string            `json:"homepage"`
 	URL       string            `json:"url"`
 	Version   string            `json:"version"`
+	SHA256    string            `json:"sha256"`
 	Artifacts []json.RawMessage `json:"artifacts"`
 	Caveats   *string           `json:"caveats"`
 	DependsOn struct {
@@ -123,6 +124,7 @@ func (c *Cask) DescString() string {
 type apiSource struct {
 	kind    string // "formula" or "cask"
 	index   map[string][2]int64
+	size    int64 // size of the JSON file the index describes
 	indexOK bool
 	loaded  bool
 	all     []json.RawMessage
@@ -166,6 +168,7 @@ func (s *apiSource) loadIndex() {
 	if err != nil || fi.Size() != idx.SourceSize {
 		return
 	}
+	s.size = fi.Size()
 	if idx.Casks != nil {
 		s.index = idx.Casks
 	} else {
@@ -173,21 +176,18 @@ func (s *apiSource) loadIndex() {
 	}
 }
 
+// maxRecordSize bounds a single indexed record; real records are well under 1MB.
+const maxRecordSize = 16 << 20
+
 // Raw returns the raw JSON record for an exact name/token.
 func (s *apiSource) Raw(name string) (json.RawMessage, bool) {
 	s.loadIndex()
 	if s.index != nil {
 		if loc, ok := s.index[name]; ok {
-			f, err := os.Open(s.jsonPath())
-			if err == nil {
-				defer f.Close()
-				buf := make([]byte, loc[1])
-				if _, err := f.ReadAt(buf, loc[0]); err == nil || err == io.EOF {
-					if len(buf) > 0 && buf[0] == '{' {
-						return buf, true
-					}
-				}
+			if buf := s.readIndexed(loc); buf != nil {
+				return buf, true
 			}
+			odebug("%s index entry for %s is invalid; reading %s", s.kind, name, s.jsonPath())
 		} else if !s.loaded {
 			return nil, false
 		}
@@ -197,6 +197,28 @@ func (s *apiSource) Raw(name string) (json.RawMessage, bool) {
 		return s.all[i], true
 	}
 	return nil, false
+}
+
+// readIndexed reads the record at an index location, or returns nil when the
+// entry is out of bounds or does not hold a JSON object.
+func (s *apiSource) readIndexed(loc [2]int64) json.RawMessage {
+	off, n := loc[0], loc[1]
+	if off < 0 || n <= 0 || n > maxRecordSize || off > s.size-n {
+		return nil
+	}
+	f, err := os.Open(s.jsonPath())
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	buf := make([]byte, n)
+	if _, err := f.ReadAt(buf, off); err != nil && err != io.EOF {
+		return nil
+	}
+	if buf[0] != '{' || !json.Valid(buf) {
+		return nil
+	}
+	return buf
 }
 
 func (s *apiSource) loadAll() {
@@ -350,12 +372,25 @@ func lookupCask(token string) *Cask {
 	var c *Cask
 	if raw, ok := caskAPI.Raw(token); ok {
 		c = &Cask{}
-		if json.Unmarshal(raw, c) != nil {
+		if json.Unmarshal(mergeVariationsRaw(raw), c) != nil {
 			c = nil
 		}
 	}
 	if c == nil {
-		// old tokens
+		if real, ok := caskOldTokens()[token]; ok && real != token {
+			c = lookupCask(real)
+		}
+	}
+	caskCache[token] = c
+	return c
+}
+
+var caskOldTokenIndex map[string]string
+
+// caskOldTokens maps renamed cask tokens to their current token (built once).
+func caskOldTokens() map[string]string {
+	if caskOldTokenIndex == nil {
+		caskOldTokenIndex = map[string]string{}
 		for _, raw := range caskAPI.All() {
 			var m struct {
 				Token     string   `json:"token"`
@@ -365,18 +400,35 @@ func lookupCask(token string) *Cask {
 				continue
 			}
 			for _, o := range m.OldTokens {
-				if o == token {
-					c = lookupCask(m.Token)
-					break
+				if _, ok := caskOldTokenIndex[o]; !ok {
+					caskOldTokenIndex[o] = m.Token
 				}
-			}
-			if c != nil {
-				break
 			}
 		}
 	}
-	caskCache[token] = c
-	return c
+	return caskOldTokenIndex
+}
+
+// mergeVariationsRaw overlays the current platform's variation onto a raw
+// record (Homebrew's API.merge_variations) and drops the variations key, so
+// every field read from it (url, sha256, artifacts, uninstall/zap stanzas,
+// ...) matches this machine.
+func mergeVariationsRaw(raw json.RawMessage) json.RawMessage {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil || m["variations"] == nil {
+		return raw
+	}
+	var vars map[string]map[string]json.RawMessage
+	_ = json.Unmarshal(m["variations"], &vars)
+	delete(m, "variations")
+	for k, v := range vars[platformTag()] {
+		m[k] = v
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return raw
+	}
+	return out
 }
 
 // rawMap returns the raw record as a generic map (for JSON output).
@@ -408,6 +460,90 @@ func rawCaskMap(token string) map[string]any {
 	dec.UseNumber()
 	if dec.Decode(&m) != nil {
 		return nil
+	}
+	applyVariationsMap(m, keepVariations)
+	return m
+}
+
+// formulaFromCore reports whether f comes from homebrew/core (or has no tap).
+func formulaFromCore(f *Formula) bool { return f.Tap == "" || f.Tap == "homebrew/core" }
+
+// caskFromCore reports whether c comes from homebrew/cask (or has no tap).
+func caskFromCore(c *Cask) bool { return c.Tap == "" || c.Tap == "homebrew/cask" }
+
+// qualifiedFormulaName is the name a formula is addressed by: the bare name for core
+// formulae, the tap-qualified full name for third-party taps.
+func qualifiedFormulaName(f *Formula) string {
+	if formulaFromCore(f) || f.FullName == "" {
+		return f.Name
+	}
+	return f.FullName
+}
+
+// qualifiedCaskToken is the cask counterpart of qualifiedFormulaName.
+func qualifiedCaskToken(c *Cask) string {
+	if caskFromCore(c) || c.FullToken == "" {
+		return c.Token
+	}
+	return c.FullToken
+}
+
+// formulaMapFor returns the API-style JSON record of a formula: the cached API
+// record for homebrew/core, otherwise one synthesized from the parsed formula
+// (third-party taps have no API) with the same keys.
+func formulaMapFor(f *Formula) map[string]any {
+	if formulaFromCore(f) {
+		if m := rawFormulaMap(f.Name); m != nil {
+			return m
+		}
+	}
+	b, err := json.Marshal(f)
+	if err != nil {
+		return nil
+	}
+	var m map[string]any
+	dec := json.NewDecoder(strings.NewReader(string(b)))
+	dec.UseNumber()
+	if dec.Decode(&m) != nil {
+		return nil
+	}
+	// Homebrew emits empty lists rather than null, and null for unset strings.
+	for k, v := range m {
+		if v == nil {
+			switch k {
+			case "oldnames", "aliases", "versioned_formulae", "requirements", "uses_from_macos", "uses_from_macos_bounds",
+				"build_dependencies", "dependencies", "test_dependencies", "recommended_dependencies", "optional_dependencies",
+				"conflicts_with", "conflicts_with_reasons", "executables":
+				m[k] = []any{}
+			}
+		}
+	}
+	for _, k := range []string{"desc", "license", "homepage", "tap_git_head", "ruby_source_path"} {
+		if m[k] == "" {
+			m[k] = nil
+		}
+	}
+	if vs, ok := m["versions"].(map[string]any); ok && vs["head"] == "" {
+		vs["head"] = nil
+	}
+	if us, ok := m["urls"].(map[string]any); ok {
+		for _, spec := range us {
+			if sm, ok := spec.(map[string]any); ok {
+				for k, v := range sm {
+					if v == "" {
+						sm[k] = nil
+					}
+				}
+			}
+		}
+	}
+	m["bottle"] = map[string]any{}
+	m["options"] = []any{}
+	m["link_overwrite"] = []any{}
+	m["pinned"] = false
+	m["outdated"] = false
+	if keepVariations {
+		m["variations"] = map[string]any{}
 	}
 	return m
 }
