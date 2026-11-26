@@ -50,17 +50,70 @@ type linkConflict struct {
 	rel, dst string
 }
 
+// validKeg reports whether name and version form a path strictly inside a rack.
+func validKeg(name, version string) bool {
+	return validName(name) && validVersion(version)
+}
+
+// isEmptyDir reports whether p is a real (non-symlink) directory with no entries.
+func isEmptyDir(p string) bool {
+	entries, err := os.ReadDir(p)
+	return err == nil && len(entries) == 0
+}
+
+// statOK reports whether p (following symlinks) exists; false for a broken link.
+func statOK(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+// expandableDirLink reports whether the prefix symlink at p points into the
+// Cellar or opt (so ensureRealDir may turn it into a real directory). Links the
+// user made to anywhere else are left alone.
+func expandableDirLink(p string) bool {
+	return resolvesInto(p, cellar()) || resolvesInto(p, optDir())
+}
+
+// blockingDirLink returns the first directory between the prefix and dst that
+// is a symlink ensureRealDir must not expand, or "".
+func blockingDirLink(dst string) string {
+	p := brewPrefix()
+	var chain []string
+	for d := filepath.Dir(dst); d != p && strings.HasPrefix(d, p+"/"); d = filepath.Dir(d) {
+		chain = append(chain, d)
+	}
+	for i := len(chain) - 1; i >= 0; i-- {
+		fi, err := os.Lstat(chain[i])
+		if err != nil {
+			return ""
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			if !expandableDirLink(chain[i]) {
+				return chain[i]
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
 // linkKeg symlinks files of the keg into the prefix. Directories are created
 // as real directories; files (and symlinks inside the keg) become relative symlinks.
 func linkKeg(name, version string, overwrite, dryRun bool) (int, []linkConflict, error) {
+	if !validKeg(name, version) {
+		return 0, nil, fmt.Errorf("invalid keg %q %q", name, version)
+	}
 	keg := kegPath(name, version)
 	roots := kegRoots(name, version)
+	rack := filepath.Join(cellar(), name)
 	type op struct {
 		src, dst string
-		replace  bool
+		replace  bool // remove dst first
+		silent   bool // replacing a stale link, not a conflict --overwrite resolves
 	}
 	var ops []op
 	var conflicts []linkConflict
+	blocked := map[string]bool{}
 	for _, top := range linkableDirs {
 		base := filepath.Join(keg, top)
 		if !isDir(base) {
@@ -78,26 +131,43 @@ func linkKeg(name, version string, overwrite, dryRun bool) (int, []linkConflict,
 			if d.IsDir() {
 				return nil // directories are created on demand
 			}
+			if b := blockingDirLink(dst); b != "" {
+				// A directory symlink the user made (pointing outside the
+				// Cellar) is never exploded or replaced.
+				if !blocked[b] {
+					blocked[b] = true
+					brel, _ := filepath.Rel(brewPrefix(), b)
+					conflicts = append(conflicts, linkConflict{brel, b})
+				}
+				return nil
+			}
 			fi, err := os.Lstat(dst)
+			isLink := err == nil && fi.Mode()&os.ModeSymlink != 0
 			switch {
 			case err != nil:
-				ops = append(ops, op{p, dst, false})
-			case fi.Mode()&os.ModeSymlink != 0 && resolvesIntoAny(dst, roots):
+				ops = append(ops, op{p, dst, false, false})
+			case isLink && resolvesIntoAny(dst, roots):
 				// already linked
-			case overwrite:
-				ops = append(ops, op{p, dst, true})
+			case isLink && (!statOK(dst) || resolvesInto(dst, rack)):
+				// Broken link, or a link into another version of this rack:
+				// Homebrew replaces these without asking.
+				ops = append(ops, op{p, dst, true, true})
+			case overwrite && (isLink || !fi.IsDir() || isEmptyDir(dst)):
+				ops = append(ops, op{p, dst, true, false})
 			default:
+				// Without --overwrite anything else conflicts; with it, a
+				// non-empty real directory still does (it is never deleted).
 				conflicts = append(conflicts, linkConflict{rel, dst})
 			}
 			return nil
 		})
 	}
-	if len(conflicts) > 0 && !overwrite {
+	if len(conflicts) > 0 {
 		return 0, conflicts, nil
 	}
 	if dryRun {
 		for _, o := range ops {
-			if o.replace {
+			if o.replace && !o.silent {
 				fmt.Println(o.dst)
 			}
 		}
@@ -109,7 +179,9 @@ func linkKeg(name, version string, overwrite, dryRun bool) (int, []linkConflict,
 			return n, nil, err
 		}
 		if o.replace {
-			if err := os.RemoveAll(o.dst); err != nil {
+			// Unlink a file or symlink, or remove an empty directory; never
+			// delete a directory tree.
+			if err := os.Remove(o.dst); err != nil {
 				return n, nil, err
 			}
 		}
@@ -134,6 +206,7 @@ func linkKeg(name, version string, overwrite, dryRun bool) (int, []linkConflict,
 // ensureRealDir makes dir (and parents) exist inside the prefix. A directory
 // symlink that points into some keg is expanded into a real directory of
 // per-entry symlinks, like Homebrew does when two kegs share a directory.
+// Symlinks pointing anywhere else are refused.
 func ensureRealDir(dir string) error {
 	p := brewPrefix()
 	if dir == p || !strings.HasPrefix(dir, p+"/") {
@@ -148,6 +221,9 @@ func ensureRealDir(dir string) error {
 	}
 	if fi.Mode()&os.ModeSymlink == 0 {
 		return nil
+	}
+	if !expandableDirLink(dir) {
+		return fmt.Errorf("%s is a symlink that does not point into the Cellar", dir)
 	}
 	// Resolve only this link (not the whole path) so relative links stay valid.
 	target, err := os.Readlink(dir)
@@ -198,6 +274,9 @@ func setOptLink(name, version string) error {
 // unlinkKeg removes prefix symlinks that resolve into the keg, then prunes
 // directories left empty (never the top-level prefix directories).
 func unlinkKeg(name, version string, dryRun bool) (int, []string) {
+	if !validKeg(name, version) {
+		return 0, nil
+	}
 	keg := kegPath(name, version)
 	roots := kegRoots(name, version)
 	removed := 0
@@ -289,6 +368,15 @@ func isKegLinked(name string) bool { return linkedVersion(name) != "" }
 // removeRack deletes kegs of a formula (all when versions is nil) and cleans up
 // opt/linked/pinned records. Prints Homebrew's "Uninstalling ..." lines.
 func removeKegs(name string, versions []string) error {
+	rack := filepath.Join(cellar(), name)
+	if !validName(name) || filepath.Dir(filepath.Clean(rack)) != cellar() {
+		return fmt.Errorf("refusing to remove %s: not a Cellar rack", rack)
+	}
+	for _, v := range versions {
+		if keg := filepath.Join(rack, v); !validVersion(v) || filepath.Dir(filepath.Clean(keg)) != rack {
+			return fmt.Errorf("refusing to remove %s: not a keg of %s", keg, name)
+		}
+	}
 	for _, v := range versions {
 		keg := kegPath(name, v)
 		summary := kegSummary(keg)
@@ -298,7 +386,6 @@ func removeKegs(name string, versions []string) error {
 			return err
 		}
 	}
-	rack := filepath.Join(cellar(), name)
 	remaining := kegVersions(name)
 	if len(remaining) == 0 {
 		_ = os.RemoveAll(rack)
