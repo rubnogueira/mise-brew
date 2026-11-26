@@ -363,20 +363,34 @@ type managerStatus struct {
 	Packages  []pkgStatus `json:"packages"`
 }
 
-var statusCache map[string]managerStatus
+var (
+	statusCache map[string]managerStatus
+	statusErr   error
+)
 
+// packagesStatus returns mise's view of declared packages. On failure it
+// returns an empty map; callers that must not act on missing data (e.g.
+// autoremove) check packagesStatusErr.
 func packagesStatus() map[string]managerStatus {
 	if statusCache != nil {
 		return statusCache
 	}
 	statusCache = map[string]managerStatus{}
 	out, err := miseOutput("bootstrap", "packages", "status", "--json")
-	if err != nil {
-		odebug("status failed: %v", err)
-		return statusCache
+	if err == nil {
+		err = json.Unmarshal(out, &statusCache)
 	}
-	_ = json.Unmarshal(out, &statusCache)
+	if err != nil {
+		statusErr = err
+		odebug("status failed: %v", err)
+	}
 	return statusCache
+}
+
+// packagesStatusErr reports why packagesStatus could not read mise's status.
+func packagesStatusErr() error {
+	packagesStatus()
+	return statusErr
 }
 
 // declaredSet returns declared (present) package names for a manager.

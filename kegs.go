@@ -39,6 +39,25 @@ type Receipt struct {
 	Arch string `json:"arch"`
 }
 
+// validName reports whether name is safe to use as a single path component
+// for a formula rack, cask token or tap segment: no separators, no "." or
+// "..", no leading dot or dash. Every user-supplied name must pass this
+// before it is joined onto the Cellar, Caskroom or prefix.
+func validName(name string) bool {
+	if name == "" || len(name) > 255 {
+		return false
+	}
+	for i, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case i > 0 && strings.ContainsRune("@+_.-", r):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func readReceipt(kegPath string) *Receipt {
 	data, err := os.ReadFile(filepath.Join(kegPath, "INSTALL_RECEIPT.json"))
 	if err != nil {
