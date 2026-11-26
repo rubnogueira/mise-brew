@@ -8,12 +8,14 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -110,23 +112,80 @@ func cmdEdit(args []string) {
 		return
 	}
 	opoo("mise installs from the formulae.brew.sh API, so edits to these files do not change what gets installed.")
-	editor := os.Getenv("HOMEBREW_EDITOR")
-	for _, k := range []string{"HOMEBREW_VISUAL", "VISUAL", "EDITOR"} {
-		if editor == "" {
-			editor = os.Getenv(k)
-		}
-	}
-	if editor == "" {
-		editor = "vi"
-	}
-	fields := strings.Fields(editor)
-	bin, err := exec.LookPath(fields[0])
+	editor := editorCommand()
+	bin, err := exec.LookPath(editor[0])
 	if err != nil {
 		odie("%v", err)
 	}
-	if err := syscall.Exec(bin, append(fields, paths...), os.Environ()); err != nil {
+	if err := syscall.Exec(bin, append(editor, paths...), os.Environ()); err != nil {
 		odie("%v", err)
 	}
+}
+
+// editorCommand resolves the editor like Homebrew's which_editor: the first
+// non-blank of HOMEBREW_EDITOR, HOMEBREW_VISUAL, VISUAL and EDITOR, split into
+// words shell-style (so "code --wait" works), else vim, nano or vi.
+func editorCommand() []string {
+	for _, k := range []string{"HOMEBREW_EDITOR", "HOMEBREW_VISUAL", "VISUAL", "EDITOR"} {
+		if args := shellSplit(os.Getenv(k)); len(args) > 0 {
+			return args
+		}
+	}
+	for _, e := range []string{"vim", "nano"} {
+		if _, err := exec.LookPath(e); err == nil {
+			return []string{e}
+		}
+	}
+	return []string{"vi"}
+}
+
+// shellSplit splits s into words like a POSIX shell (quotes and backslashes,
+// no expansions).
+func shellSplit(s string) []string {
+	var words []string
+	var cur strings.Builder
+	inWord := false
+	var quote rune
+	escaped := false
+	for _, r := range s {
+		switch {
+		case escaped:
+			if quote == '"' && !strings.ContainsRune("\\\"$`\n", r) {
+				cur.WriteByte('\\')
+			}
+			cur.WriteRune(r)
+			escaped = false
+		case quote == '\'':
+			if r == '\'' {
+				quote = 0
+			} else {
+				cur.WriteRune(r)
+			}
+		case r == '\\':
+			escaped, inWord = true, true
+		case quote == '"':
+			if r == '"' {
+				quote = 0
+			} else {
+				cur.WriteRune(r)
+			}
+		case r == '\'' || r == '"':
+			quote, inWord = r, true
+		case r == ' ' || r == '\t' || r == '\n':
+			if inWord {
+				words = append(words, cur.String())
+				cur.Reset()
+				inWord = false
+			}
+		default:
+			cur.WriteRune(r)
+			inWord = true
+		}
+	}
+	if inWord {
+		words = append(words, cur.String())
+	}
+	return words
 }
 
 func cmdLog(args []string) {
@@ -142,8 +201,9 @@ func cmdLog(args []string) {
 	if v, ok := o.Val("max-count"); ok {
 		fmt.Sscanf(v, "%d", &max)
 	}
-	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/commits?path=%s&per_page=%d", src.owner, src.repo, src.path, max)
-	body, err := httpGet(url, "application/vnd.github+json")
+	q := url.Values{"path": {src.path}, "per_page": {strconv.Itoa(max)}}
+	u := fmt.Sprintf("https://api.github.com/repos/%s/%s/commits?%s", url.PathEscape(src.owner), url.PathEscape(src.repo), q.Encode())
+	body, err := httpGet(u, "application/vnd.github+json")
 	if err != nil {
 		odie("GitHub API: %v", err)
 	}
@@ -175,7 +235,7 @@ func cmdLog(args []string) {
 			fmt.Println("    " + l)
 		}
 		if o.Has("patch") || o.Has("stat") {
-			cb, err := httpGet(fmt.Sprintf("https://api.github.com/repos/%s/%s/commits/%s", src.owner, src.repo, c.SHA), "application/vnd.github+json")
+			cb, err := httpGet(fmt.Sprintf("https://api.github.com/repos/%s/%s/commits/%s", url.PathEscape(src.owner), url.PathEscape(src.repo), url.PathEscape(c.SHA)), "application/vnd.github+json")
 			if err != nil {
 				continue
 			}
@@ -206,8 +266,9 @@ func cmdLog(args []string) {
 
 // --- fetch / unpack ---------------------------------------------------------
 
-// download fetches url to dst (via a temp file), verifying sha256 when given.
-func download(url, dst, sha string, auth bool) error {
+// download fetches url to dst (via a unique temp file in the same directory,
+// so concurrent fetches cannot clobber each other), verifying sha256 when given.
+func download(url, dst, sha string, auth bool) (err error) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
@@ -228,23 +289,34 @@ func download(url, dst, sha string, auth bool) error {
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("%s: HTTP %d", url, resp.StatusCode)
 	}
-	tmp := dst + ".incomplete"
-	f, err := os.Create(tmp)
+	f, err := os.CreateTemp(filepath.Dir(dst), ".dl-*")
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
+	defer func() {
+		if err != nil {
+			f.Close()
+			os.Remove(tmp)
+		}
+	}()
 	h := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(f, h), resp.Body); err != nil {
-		f.Close()
-		os.Remove(tmp)
+	if _, err = io.Copy(io.MultiWriter(f, h), resp.Body); err != nil {
 		return err
 	}
-	f.Close()
 	if sha != "" && sha != "no_check" {
-		if got := hex.EncodeToString(h.Sum(nil)); got != sha {
-			os.Remove(tmp)
+		if got := hex.EncodeToString(h.Sum(nil)); !strings.EqualFold(got, sha) {
 			return fmt.Errorf("SHA256 mismatch\nExpected: %s\n  Actual: %s\n    File: %s", sha, got, url)
 		}
+	}
+	if err = f.Chmod(0o644); err != nil {
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
 	}
 	return os.Rename(tmp, dst)
 }
@@ -276,6 +348,45 @@ func caskCachePath(c *Cask) string {
 	return filepath.Join(miseBrewCacheDir(), "downloads", c.Token+"--"+c.Version+ext)
 }
 
+// nativeBottleTag is the bottle tag mise itself would pour for f, ignoring
+// any --bottle-tag override.
+func nativeBottleTag(f *Formula) string {
+	if v, ok := os.LookupEnv("MISEBREW_BOTTLE_TAG"); ok {
+		os.Unsetenv("MISEBREW_BOTTLE_TAG")
+		defer os.Setenv("MISEBREW_BOTTLE_TAG", v)
+	}
+	tag, _, _, _ := bottleFileFor(f)
+	return tag
+}
+
+// bottleDownloadPath is where f's bottle for tag is stored: mise's bottle
+// cache when it is the bottle mise would pour, else a separate tagged file so
+// a foreign bottle (`--bottle-tag`) can never be poured by mise.
+func bottleDownloadPath(f *Formula, tag string) string {
+	if tag == nativeBottleTag(f) {
+		return bottleCachePath(f)
+	}
+	return filepath.Join(miseBrewCacheDir(), "downloads", f.Name+"--"+f.PkgVersion()+"."+tag+".bottle.tar.gz")
+}
+
+// safeVersion reports whether a version (which tap Ruby files control) can be
+// embedded in a single path component.
+func safeVersion(v string) bool {
+	return v != "" && v != "." && v != ".." && !strings.ContainsAny(v, "/\\\x00")
+}
+
+// checkPathParts refuses a name/version pair that could escape the cache or
+// unpack directory it is joined onto.
+func checkPathParts(name, version string) error {
+	if !validName(name) {
+		return fmt.Errorf("refusing to use unsafe name %q in a path", name)
+	}
+	if !safeVersion(version) {
+		return fmt.Errorf("refusing to use unsafe version %q of %s in a path", version, name)
+	}
+	return nil
+}
+
 func cmdFetch(args []string) {
 	o := parseArgs(args, nil, nil)
 	o.applyGlobal()
@@ -285,8 +396,12 @@ func cmdFetch(args []string) {
 	if o.Has("HEAD") {
 		odie("--HEAD is not supported: mise installs Homebrew bottles.")
 	}
-	if tag, ok := o.Val("bottle-tag"); ok {
-		os.Setenv("MISEBREW_BOTTLE_TAG", tag)
+	bottleTag, tagged := o.Val("bottle-tag")
+	if tagged {
+		if !validName(bottleTag) {
+			odie("Invalid bottle tag: %s", bottleTag)
+		}
+		os.Setenv("MISEBREW_BOTTLE_TAG", bottleTag)
 	}
 	names := o.Pos
 	if o.Has("deps") {
@@ -303,6 +418,11 @@ func cmdFetch(args []string) {
 	for _, n := range names {
 		if !o.onlyCask() {
 			if f := lookupFormula(n); f != nil {
+				if err := checkPathParts(f.Name, f.Versions.Stable); err != nil {
+					onoe("%v", err)
+					failed = true
+					continue
+				}
 				if o.Has("build-from-source") || o.Has("build-bottle") {
 					p := filepath.Join(miseBrewCacheDir(), "downloads", f.Name+"--"+f.Versions.Stable+filepath.Ext(f.URLs.Stable.URL))
 					if !fetchOne(f.URLs.Stable.URL, p, f.URLs.Stable.Checksum, false, o.Has("force")) {
@@ -310,19 +430,28 @@ func cmdFetch(args []string) {
 					}
 					continue
 				}
-				_, url, sha, ok := bottleFileFor(f)
+				tag, url, sha, ok := bottleFileFor(f)
 				if !ok {
 					onoe("%s has no bottle for %s", f.Name, platformTag())
 					failed = true
 					continue
 				}
-				if !fetchOne(url, bottleCachePath(f), sha, true, o.Has("force")) {
+				dst := bottleCachePath(f)
+				if tagged {
+					dst = bottleDownloadPath(f, tag)
+				}
+				if !fetchOne(url, dst, sha, true, o.Has("force")) {
 					failed = true
 				}
 				continue
 			}
 		}
 		if c := lookupCask(n); c != nil && !o.onlyFormula() {
+			if err := checkPathParts(c.Token, c.Version); err != nil {
+				onoe("%v", err)
+				failed = true
+				continue
+			}
 			if !fetchOne(c.URL, caskCachePath(c), caskSHA(c), false, o.Has("force")) {
 				failed = true
 			}
@@ -337,7 +466,18 @@ func cmdFetch(args []string) {
 }
 
 func caskSHA(c *Cask) string {
-	if m := rawCaskMap(c.Token); m != nil {
+	if c.Tap == "" || c.Tap == "homebrew/cask" {
+		if m := rawCaskMap(c.Token); m != nil {
+			if s, ok := m["sha256"].(string); ok {
+				return s
+			}
+		}
+		return ""
+	}
+	// Third-party tap casks: use the sha256 parsed from the Ruby file when the
+	// Cask carries one (as its "sha256" JSON field); never the core cask's.
+	var m map[string]any
+	if b, err := json.Marshal(c); err == nil && json.Unmarshal(b, &m) == nil {
 		if s, ok := m["sha256"].(string); ok {
 			return s
 		}
@@ -347,11 +487,17 @@ func caskSHA(c *Cask) string {
 
 func fetchOne(url, dst, sha string, auth, force bool) bool {
 	if fileExists(dst) && !force {
-		if sha == "" || sha == "no_check" || fileSHA(dst) == sha {
+		if sha == "" || sha == "no_check" || strings.EqualFold(fileSHA(dst), sha) {
 			fmt.Printf("Already downloaded: %s\n", dst)
 			return true
 		}
 		opoo("Checksum of cached %s no longer matches; re-downloading", dst)
+	}
+	switch sha {
+	case "":
+		opoo("Cannot verify integrity of '%s': no checksum is available, so the download is only protected by TLS.", filepath.Base(dst))
+	case "no_check":
+		opoo("No checksum defined for '%s', skipping verification.", filepath.Base(dst))
 	}
 	ohai("Downloading %s", url)
 	if err := download(url, dst, sha, auth); err != nil {
@@ -376,6 +522,9 @@ func cmdUnpack(args []string) {
 		f := lookupFormula(n)
 		if f == nil {
 			odie("No available formula with the name \"%s\".", n)
+		}
+		if err := checkPathParts(f.Name, f.Versions.Stable); err != nil {
+			odie("%v", err)
 		}
 		dir := filepath.Join(dest, f.Name+"-"+f.Versions.Stable)
 		if fileExists(dir) {
@@ -621,11 +770,30 @@ func cmdLinkage(args []string) {
 
 func aliasDir() string { return filepath.Join(homeDir(), ".brew-aliases") }
 
+var aliasNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// aliasPath returns ~/.brew-aliases/<name>, or false when name is not a valid
+// alias name (so it can never point outside the alias directory).
+func aliasPath(name string) (string, bool) {
+	if !aliasNameRe.MatchString(name) {
+		return "", false
+	}
+	return filepath.Join(aliasDir(), name), true
+}
+
+func mustAliasPath(name string) string {
+	p, ok := aliasPath(name)
+	if !ok {
+		odie("Invalid alias name: %q (use letters, digits, '.', '_' and '-')", name)
+	}
+	return p
+}
+
 func cmdAlias(args []string) {
 	o := parseArgs(args, nil, nil)
 	if len(o.Pos) == 0 {
 		for _, n := range listDirNames(aliasDir(), false) {
-			if v := readAlias(n); v != "" {
+			if v := readAlias(n); v != "" && aliasNameRe.MatchString(n) {
 				fmt.Printf("brew alias %s='%s'\n", n, v)
 			}
 		}
@@ -634,9 +802,10 @@ func cmdAlias(args []string) {
 	spec := strings.Join(o.Pos, " ")
 	name, val, hasVal := strings.Cut(spec, "=")
 	name = strings.TrimSpace(name)
+	p := mustAliasPath(name)
 	if !hasVal {
 		if o.Has("edit") {
-			openInEditor(filepath.Join(aliasDir(), name))
+			openInEditor(p)
 			return
 		}
 		if v := readAlias(name); v != "" {
@@ -649,21 +818,33 @@ func cmdAlias(args []string) {
 		odie("'%s' is a reserved command. Sorry.", name)
 	}
 	val = strings.Trim(strings.TrimSpace(val), `'"`)
+	// The command is shell code by design (as in Homebrew), but it must stay on
+	// one line so it cannot escape the comment lines it is also written into.
+	if strings.ContainsAny(val, "\n\r\x00") {
+		odie("Invalid alias command: it must be a single line.")
+	}
 	_ = os.MkdirAll(aliasDir(), 0o755)
 	content := fmt.Sprintf("#!/bin/bash\n# alias: brew %s\n#:  * `%s` [args...]\n#:    `brew %s` is an alias for `brew %s`\n\"${HOMEBREW_BREW_FILE:-brew}\" %s \"$@\"\n", name, name, name, val, val)
 	if strings.HasPrefix(val, "!") {
 		content = fmt.Sprintf("#!/bin/bash\n# alias: brew %s\n%s \"$@\"\n", name, strings.TrimPrefix(val, "!"))
 	}
-	if err := os.WriteFile(filepath.Join(aliasDir(), name), []byte(content), 0o755); err != nil {
+	if fi, err := os.Lstat(p); err == nil && !fi.Mode().IsRegular() {
+		odie("%s exists and is not an alias file.", p)
+	}
+	if err := os.WriteFile(p, []byte(content), 0o755); err != nil {
 		odie("%v", err)
 	}
 	if o.Has("edit") {
-		openInEditor(filepath.Join(aliasDir(), name))
+		openInEditor(p)
 	}
 }
 
 func readAlias(name string) string {
-	b, err := os.ReadFile(filepath.Join(aliasDir(), name))
+	p, ok := aliasPath(name)
+	if !ok {
+		return ""
+	}
+	b, err := os.ReadFile(p)
 	if err != nil {
 		return ""
 	}
@@ -684,25 +865,29 @@ func cmdUnalias(args []string) {
 		odie("Invalid usage: This command requires at least 1 alias argument.")
 	}
 	for _, n := range o.Pos {
-		if err := os.Remove(filepath.Join(aliasDir(), n)); err != nil {
+		p, ok := aliasPath(n)
+		if !ok {
+			odie("No such alias: %s", n)
+		}
+		if err := os.Remove(p); err != nil {
 			odie("No such alias: %s", n)
 		}
 	}
 }
 
 func openInEditor(p string) {
-	editor := os.Getenv("EDITOR")
-	if editor == "" {
-		editor = "vi"
-	}
-	cmd := exec.Command(editor, p)
+	editor := editorCommand()
+	cmd := exec.Command(editor[0], append(editor[1:], p)...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	_ = cmd.Run()
 }
 
 // runAlias executes ~/.brew-aliases/<name> if it exists.
 func runAlias(name string, args []string) (int, bool) {
-	p := filepath.Join(aliasDir(), name)
+	p, ok := aliasPath(name)
+	if !ok {
+		return 0, false
+	}
 	if fi, err := os.Stat(p); err != nil || fi.IsDir() {
 		return 0, false
 	}
