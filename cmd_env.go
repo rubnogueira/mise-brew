@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -105,8 +106,12 @@ func cmdCaskroom(args []string) {
 
 func cmdCache(args []string) {
 	o := parseArgs(args, nil, nil)
-	if tag, ok := o.Val("bottle-tag"); ok {
-		os.Setenv("MISEBREW_BOTTLE_TAG", tag)
+	bottleTag, tagged := o.Val("bottle-tag")
+	if tagged {
+		if !validName(bottleTag) {
+			odie("Invalid bottle tag: %s", bottleTag)
+		}
+		os.Setenv("MISEBREW_BOTTLE_TAG", bottleTag)
 	}
 	if len(o.Pos) == 0 {
 		fmt.Println(brewCacheDir())
@@ -115,8 +120,13 @@ func cmdCache(args []string) {
 	for _, n := range o.Pos {
 		if !o.onlyCask() {
 			if f := lookupFormula(n); f != nil {
+				if err := checkPathParts(f.Name, f.Versions.Stable); err != nil {
+					odie("%v", err)
+				}
 				if o.Has("build-from-source") || o.Has("HEAD") {
 					fmt.Println(filepath.Join(miseBrewCacheDir(), "downloads", f.Name+"--"+f.Versions.Stable+filepath.Ext(f.URLs.Stable.URL)))
+				} else if tag, _, _, ok := bottleFileFor(f); ok && tagged {
+					fmt.Println(bottleDownloadPath(f, tag))
 				} else {
 					fmt.Println(bottleCachePath(f))
 				}
@@ -124,6 +134,9 @@ func cmdCache(args []string) {
 			}
 		}
 		if c := lookupCask(n); c != nil && !o.onlyFormula() {
+			if err := checkPathParts(c.Token, c.Version); err != nil {
+				odie("%v", err)
+			}
 			fmt.Println(caskCachePath(c))
 			continue
 		}
@@ -152,22 +165,18 @@ func homebrewVersion() string {
 	if v := os.Getenv("MISEBREW_HOMEBREW_VERSION"); v != "" {
 		return v
 	}
-	best := ""
+	// Report the newest version any receipt claims (never below the default):
+	// an old keg's receipt must not make `brew --version` fail min-version checks.
+	best := defaultHomebrewVersion
 	for _, n := range listDirNames(optDir(), false) {
 		r := readReceipt(filepath.Join(optDir(), n))
 		if r == nil || r.HomebrewVersion == "" {
 			continue
 		}
 		v := strings.TrimSpace(strings.TrimSuffix(r.HomebrewVersion, "(mise)"))
-		if best == "" || compareVersions(v, best) > 0 {
+		if v != "" && compareVersions(v, best) > 0 {
 			best = v
 		}
-		if best != "" {
-			break
-		}
-	}
-	if best == "" {
-		return defaultHomebrewVersion
 	}
 	return best
 }
@@ -194,57 +203,124 @@ func cmdShellenv(args []string) {
 			}
 		}
 	}
-	p, c, r := brewPrefix(), cellar(), brewRepository()
-	pathHas := func(dir string) bool {
-		for _, e := range filepath.SplitList(os.Getenv("PATH")) {
-			if e == dir {
-				return true
-			}
-		}
-		return false
+	fmt.Print(shellenv(shell, os.Getenv("PATH"), brewPrefix(), cellar(), brewRepository()))
+}
+
+// shellenv ports Homebrew's Library/Homebrew/cmd/shellenv.sh. Like upstream it
+// prints nothing once PATH already starts with the prefix's bin and sbin, so
+// re-evaluating it does not duplicate INFOPATH or fpath entries; otherwise it
+// always prepends them, even when path_helper moved them behind system dirs.
+func shellenv(shell, path, p, c, r string) string {
+	if strings.HasPrefix(path+":", p+"/bin:"+p+"/sbin:") {
+		return ""
 	}
-	addPath := !(pathHas(p+"/bin") && pathHas(p+"/sbin"))
+	var b strings.Builder
+	line := func(format string, a ...any) { fmt.Fprintf(&b, format+"\n", a...) }
 	switch shell {
 	case "fish", "-fish":
-		fmt.Printf("set --global --export HOMEBREW_PREFIX \"%s\";\n", p)
-		fmt.Printf("set --global --export HOMEBREW_CELLAR \"%s\";\n", c)
-		fmt.Printf("set --global --export HOMEBREW_REPOSITORY \"%s\";\n", r)
-		if addPath {
-			fmt.Printf("fish_add_path --global --move --path \"%s/bin\" \"%s/sbin\";\n", p, p)
-		}
-		fmt.Printf("if test -n \"$MANPATH[1]\"; set --global --export MANPATH '' $MANPATH; end;\n")
-		fmt.Printf("if not contains \"%s/share/info\" $INFOPATH; set --global --export INFOPATH \"%s/share/info\" $INFOPATH; end;\n", p, p)
+		q := fishQuote
+		line("set --global --export HOMEBREW_PREFIX %s;", q(p))
+		line("set --global --export HOMEBREW_CELLAR %s;", q(c))
+		line("set --global --export HOMEBREW_REPOSITORY %s;", q(r))
+		line("fish_add_path --global --move --path %s %s;", q(p+"/bin"), q(p+"/sbin"))
+		line(`if test -n "$MANPATH"; set --global --export MANPATH (string replace --regex '^:*(.*?):*$' ':$1' -- "$MANPATH"); end;`)
+		line("if not set --query INFOPATH; set INFOPATH ''; end; set --global --export INFOPATH %s $INFOPATH;", q(p+"/share/info"))
 	case "csh", "-csh", "tcsh", "-tcsh":
-		fmt.Printf("setenv HOMEBREW_PREFIX %s;\n", p)
-		fmt.Printf("setenv HOMEBREW_CELLAR %s;\n", c)
-		fmt.Printf("setenv HOMEBREW_REPOSITORY %s;\n", r)
-		if addPath {
-			fmt.Printf("setenv PATH %s/bin:%s/sbin:$PATH;\n", p, p)
-		}
-		fmt.Printf("test ${?MANPATH} -eq 1 && setenv MANPATH :${MANPATH};\n")
-		fmt.Printf("setenv INFOPATH %s/share/info`test ${?INFOPATH} -eq 1 && echo :${INFOPATH}`;\n", p)
+		line("setenv HOMEBREW_PREFIX %s;", cshWord(p))
+		line("setenv HOMEBREW_CELLAR %s;", cshWord(c))
+		line("setenv HOMEBREW_REPOSITORY %s;", cshWord(r))
+		line("setenv PATH %s;", cshQuote(p+"/bin:"+p+"/sbin:", "$PATH"))
+		line("test ${?MANPATH} -eq 1 && test -n \"${MANPATH}\" && setenv MANPATH :`printf '%%s' \"${MANPATH}\" | /usr/bin/sed -e 's/^:*//' -e 's/:*$//'`;")
+		line("test ${?INFOPATH} -eq 1 || setenv INFOPATH '';")
+		line("setenv INFOPATH %s;", cshQuote(p+"/share/info:", "${INFOPATH}"))
 	case "pwsh", "-pwsh", "pwsh-preview", "-pwsh-preview":
-		fmt.Printf("[System.Environment]::SetEnvironmentVariable('HOMEBREW_PREFIX','%s',[System.EnvironmentVariableTarget]::Process)\n", p)
-		fmt.Printf("[System.Environment]::SetEnvironmentVariable('HOMEBREW_CELLAR','%s',[System.EnvironmentVariableTarget]::Process)\n", c)
-		fmt.Printf("[System.Environment]::SetEnvironmentVariable('HOMEBREW_REPOSITORY','%s',[System.EnvironmentVariableTarget]::Process)\n", r)
-		if addPath {
-			fmt.Printf("[System.Environment]::SetEnvironmentVariable('PATH',$('%s/bin:%s/sbin:'+$ENV:PATH),[System.EnvironmentVariableTarget]::Process)\n", p, p)
-		}
-		fmt.Printf("[System.Environment]::SetEnvironmentVariable('MANPATH',$('%s/share/man'+$(if(${ENV:MANPATH}){':'+${ENV:MANPATH}})+':'),[System.EnvironmentVariableTarget]::Process)\n", p)
-		fmt.Printf("[System.Environment]::SetEnvironmentVariable('INFOPATH',$('%s/share/info'+$(if(${ENV:INFOPATH}){':'+${ENV:INFOPATH}})),[System.EnvironmentVariableTarget]::Process)\n", p)
+		q := pwshQuote
+		line("[System.Environment]::SetEnvironmentVariable('HOMEBREW_PREFIX',%s,[System.EnvironmentVariableTarget]::Process)", q(p))
+		line("[System.Environment]::SetEnvironmentVariable('HOMEBREW_CELLAR',%s,[System.EnvironmentVariableTarget]::Process)", q(c))
+		line("[System.Environment]::SetEnvironmentVariable('HOMEBREW_REPOSITORY',%s,[System.EnvironmentVariableTarget]::Process)", q(r))
+		line("[System.Environment]::SetEnvironmentVariable('PATH',$(%s+$ENV:PATH),[System.EnvironmentVariableTarget]::Process)", q(p+"/bin:"+p+"/sbin:"))
+		line("if (${ENV:MANPATH}) { [System.Environment]::SetEnvironmentVariable('MANPATH',(':'+${ENV:MANPATH}.Trim(':')),[System.EnvironmentVariableTarget]::Process) }")
+		line("[System.Environment]::SetEnvironmentVariable('INFOPATH',(%s+${ENV:INFOPATH}),[System.EnvironmentVariableTarget]::Process)", q(p+"/share/info:"))
 	default: // bash, zsh, sh, dash, ksh
-		fmt.Printf("export HOMEBREW_PREFIX=\"%s\";\n", p)
-		fmt.Printf("export HOMEBREW_CELLAR=\"%s\";\n", c)
-		fmt.Printf("export HOMEBREW_REPOSITORY=\"%s\";\n", r)
-		if strings.TrimPrefix(shell, "-") == "zsh" {
-			fmt.Printf("fpath[1,0]=\"%s/share/zsh/site-functions\";\n", p)
+		q := shDQ
+		line(`export HOMEBREW_PREFIX="%s";`, q(p))
+		line(`export HOMEBREW_CELLAR="%s";`, q(c))
+		line(`export HOMEBREW_REPOSITORY="%s";`, q(r))
+		if shell == "zsh" || shell == "-zsh" {
+			line(`fpath[1,0]="%s/share/zsh/site-functions";`, q(p))
+			line("export FPATH;")
 		}
-		if addPath {
-			fmt.Printf("export PATH=\"%s/bin:%s/sbin${PATH+:$PATH}\";\n", p, p)
-		}
-		fmt.Printf("[ -z \"${MANPATH-}\" ] || export MANPATH=\":${MANPATH#:}\";\n")
-		fmt.Printf("export INFOPATH=\"%s/share/info:${INFOPATH:-}\";\n", p)
+		line(`export PATH="%s/bin:%s/sbin${PATH+:$PATH}";`, q(p), q(p))
+		line(`[ -z "${MANPATH-}" ] || { export MANPATH="${MANPATH%%"${MANPATH##*[!:]}"}"; export MANPATH=":${MANPATH#"${MANPATH%%%%[!:]*}"}"; };`)
+		line(`export INFOPATH="%s/share/info:${INFOPATH:-}";`, q(p))
 	}
+	return b.String()
+}
+
+// shDQ escapes s for use inside a POSIX/zsh double-quoted string.
+func shDQ(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if strings.ContainsRune("\\\"$`", r) {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// fishQuote returns s as a fish double-quoted string.
+func fishQuote(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		if strings.ContainsRune("\\\"$", r) {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// pwshQuote returns s as a PowerShell single-quoted (verbatim) string.
+func pwshQuote(s string) string {
+	var b strings.Builder
+	b.WriteByte('\'')
+	for _, r := range s {
+		b.WriteRune(r)
+		if strings.ContainsRune("'‘’‚‛", r) {
+			b.WriteRune(r) // PowerShell escapes (smart) single quotes by doubling
+		}
+	}
+	b.WriteByte('\'')
+	return b.String()
+}
+
+var cshPlain = regexp.MustCompile(`^[A-Za-z0-9/._+@%:,=-]*$`)
+
+// cshQuote quotes the literal s, followed by the variable expansion v (may
+// be empty), for csh/tcsh: in double quotes when nothing in s is special there
+// (matching upstream's output), else s in single quotes, where only ', ! and
+// newlines need escaping, followed by "v".
+func cshQuote(s, v string) string {
+	if cshPlain.MatchString(strings.ReplaceAll(s, " ", "")) {
+		return `"` + s + v + `"`
+	}
+	r := strings.NewReplacer("'", `'\''`, "!", `\!`, "\n", "\\\n")
+	out := "'" + r.Replace(s) + "'"
+	if v != "" {
+		out += `"` + v + `"`
+	}
+	return out
+}
+
+// cshWord is cshQuote, but leaves plain words unquoted as upstream does.
+func cshWord(s string) string {
+	if s != "" && cshPlain.MatchString(s) {
+		return s
+	}
+	return cshQuote(s, "")
 }
 
 // --- config / doctor --------------------------------------------------------
@@ -287,10 +363,7 @@ func cmdConfig([]string) {
 	for _, e := range os.Environ() {
 		if strings.HasPrefix(e, "HOMEBREW_") || strings.HasPrefix(e, "MISEBREW_") {
 			k, v, _ := strings.Cut(e, "=")
-			if strings.Contains(k, "TOKEN") || strings.Contains(k, "PASSWORD") {
-				v = "set"
-			}
-			hb = append(hb, k+": "+v)
+			hb = append(hb, k+": "+configEnvValue(k, v))
 		}
 	}
 	sort.Strings(hb)
@@ -323,6 +396,20 @@ func cmdConfig([]string) {
 		fmt.Printf("Kernel: %s\n", firstLine("uname", "-mors"))
 		fmt.Printf("glibc: %s\n", firstLine("ldd", "--version"))
 	}
+}
+
+var (
+	secretEnvRe = regexp.MustCompile(`TOKEN|PASSWORD|SECRET|KEY|AUTH|CREDENTIAL`)
+	urlUserRe   = regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.-]*://)[^/?#\s]*@`)
+)
+
+// configEnvValue hides secrets from `brew config`: variables whose name looks
+// like a credential print as "set", and user:pass@ is stripped from URLs.
+func configEnvValue(k, v string) string {
+	if secretEnvRe.MatchString(strings.ToUpper(k)) {
+		return "set"
+	}
+	return urlUserRe.ReplaceAllString(v, "$1")
 }
 
 type doctorCheck struct {
