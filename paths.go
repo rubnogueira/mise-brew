@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -14,12 +15,26 @@ var miseBrewVersion = "0.1.0"
 // defaultHomebrewVersion is reported by `brew --version` when no receipt says otherwise.
 const defaultHomebrewVersion = "5.1.15"
 
+// homeDir returns $HOME, else the account's home directory from the user
+// database. It returns "" (never a relative path) when neither is usable, so
+// callers must not join "~" paths onto it without checking.
 func homeDir() string {
-	h, err := os.UserHomeDir()
-	if err != nil {
-		return os.Getenv("HOME")
+	if h, err := os.UserHomeDir(); err == nil && filepath.IsAbs(h) {
+		return h
 	}
-	return h
+	if h := userHomeLookup(); filepath.IsAbs(h) {
+		return h
+	}
+	return ""
+}
+
+// userHomeLookup asks the user database for the home directory (a variable
+// so tests can simulate an account without one).
+var userHomeLookup = func() string {
+	if u, err := user.Current(); err == nil {
+		return u.HomeDir
+	}
+	return ""
 }
 
 func defaultPrefix() string {
@@ -75,11 +90,12 @@ func miseCacheDir() string {
 	if v := os.Getenv("MISE_CACHE_DIR"); v != "" {
 		return v
 	}
-	if runtime.GOOS == "darwin" {
-		return filepath.Join(homeDir(), "Library", "Caches", "mise")
-	}
+	// mise honours XDG_CACHE_HOME on every platform, macOS included.
 	if x := os.Getenv("XDG_CACHE_HOME"); x != "" {
 		return filepath.Join(x, "mise")
+	}
+	if runtime.GOOS == "darwin" {
+		return filepath.Join(homeDir(), "Library", "Caches", "mise")
 	}
 	return filepath.Join(homeDir(), ".cache", "mise")
 }

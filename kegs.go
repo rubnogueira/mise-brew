@@ -58,6 +58,24 @@ func validName(name string) bool {
 	return true
 }
 
+// validVersion reports whether v is safe as a single keg or cask version path
+// component. Versions are looser than names (cask versions contain commas), but
+// must never be "." or ".." or contain a separator.
+func validVersion(v string) bool {
+	return v != "" && v != "." && v != ".." && !strings.ContainsAny(v, "/\x00")
+}
+
+// validTapName reports whether every "/"-separated segment of name is a
+// validName (so "owner/tap/formula" and "formula" pass, "../x" does not).
+func validTapName(name string) bool {
+	for _, seg := range strings.Split(name, "/") {
+		if !validName(seg) {
+			return false
+		}
+	}
+	return true
+}
+
 func readReceipt(kegPath string) *Receipt {
 	data, err := os.ReadFile(filepath.Join(kegPath, "INSTALL_RECEIPT.json"))
 	if err != nil {
@@ -105,6 +123,9 @@ func installedFormulae() []string {
 }
 
 func kegVersions(name string) []string {
+	if !validName(name) {
+		return nil
+	}
 	v := listDirNames(filepath.Join(cellar(), name), true)
 	sort.Slice(v, func(i, j int) bool { return compareVersions(v[i], v[j]) < 0 })
 	return v
@@ -117,7 +138,10 @@ func readLinkVersion(link string) string {
 	if err != nil {
 		return ""
 	}
-	return filepath.Base(t)
+	if v := filepath.Base(t); validVersion(v) {
+		return v
+	}
+	return ""
 }
 
 // currentVersion returns the keg the opt link points at, else the newest keg.
@@ -154,7 +178,9 @@ func pinnedVersion(name string) string {
 	return readLinkVersion(filepath.Join(pinnedDir(), name))
 }
 
-func isPinned(name string) bool { return fileExists(filepath.Join(pinnedDir(), name)) }
+func isPinned(name string) bool {
+	return validName(name) && fileExists(filepath.Join(pinnedDir(), name))
+}
 
 func installedCasks() []string {
 	var out []string
@@ -168,6 +194,9 @@ func installedCasks() []string {
 
 // caskVersions lists real version directories (mise adds a `latest` symlink).
 func caskVersions(token string) []string {
+	if !validName(token) {
+		return nil
+	}
 	dir := filepath.Join(caskroom(), token)
 	var out []string
 	for _, v := range listDirNames(dir, true) {
@@ -206,8 +235,14 @@ func isCaskInstalled(token string) bool { return len(caskVersions(token)) > 0 }
 // resolveInstalledFormula maps an alias/old name/tap-qualified name to an installed rack name.
 func resolveInstalledFormula(name string) string {
 	n := stripCoreTap(name)
+	if !validTapName(n) {
+		return ""
+	}
 	if isThirdPartyTapName(n) {
 		n = n[strings.LastIndex(n, "/")+1:]
+	}
+	if !validName(n) {
+		return ""
 	}
 	if isFormulaInstalled(n) {
 		return n
@@ -220,8 +255,14 @@ func resolveInstalledFormula(name string) string {
 
 func resolveInstalledCask(token string) string {
 	t := stripCoreTap(token)
+	if !validTapName(t) {
+		return ""
+	}
 	if isThirdPartyTapName(t) {
 		t = t[strings.LastIndex(t, "/")+1:]
+	}
+	if !validName(t) {
+		return ""
 	}
 	if isCaskInstalled(t) {
 		return t
