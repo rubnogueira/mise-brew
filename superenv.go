@@ -168,6 +168,7 @@ func depRoots(formulae []string) []string {
 			continue
 		}
 		for _, d := range recursiveDeps(ff, depFilter{build: true}) {
+			d = baseName(d) // tap dependencies are keyed by their rack name
 			if !seen[d] && isFormulaInstalled(d) {
 				seen[d] = true
 				roots = append(roots, filepath.Join(optDir(), d))
@@ -342,11 +343,14 @@ func cmdCommand(args []string) {
 			fmt.Println(self)
 			continue
 		}
+		if !validName(a) {
+			odie("Unknown command: brew %s", a)
+		}
 		if p, err := exec.LookPath("brew-" + a); err == nil {
 			fmt.Println(p)
 			continue
 		}
-		if p := filepath.Join(aliasDir(), a); fileExists(p) {
+		if p, ok := aliasPath(a); ok && fileExists(p) {
 			fmt.Println(p)
 			continue
 		}

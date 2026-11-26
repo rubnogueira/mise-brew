@@ -473,7 +473,7 @@ func TestAutoremoveCandidates(t *testing.T) {
 func TestRubyBrewfile(t *testing.T) {
 	ruby := findRuby()
 	if ruby == "" {
-		t.Skip("ruby >= 3 not available")
+		t.Skip("ruby >= 2.6 not available")
 	}
 	dir := t.TempDir()
 	bf := filepath.Join(dir, "Brewfile")
