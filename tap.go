@@ -348,13 +348,17 @@ func rbOnSystemMatches(args string) bool {
 	return false
 }
 
+// rbAndRe splits a condition on `&&` and Ruby's `and` (GoReleaser writes
+// `Hardware::CPU.intel? and Hardware::CPU.is_64_bit?`).
+var rbAndRe = regexp.MustCompile(`\s*(?:&&|\band\b)\s*`)
+
 // rbCond evaluates simple platform conditions (`OS.mac? && Hardware::CPU.arm?`);
 // ok is false for anything else.
 func rbCond(cond string) (val, ok bool) {
 	linux, arm, _ := rbTarget()
 	cond = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(cond), "then"))
 	val = true
-	for _, t := range strings.Split(cond, "&&") {
+	for _, t := range rbAndRe.Split(cond, -1) {
 		t = strings.TrimSpace(t)
 		neg := strings.HasPrefix(t, "!")
 		t = strings.TrimSpace(strings.TrimPrefix(t, "!"))
@@ -788,7 +792,7 @@ func parseTapCask(src, tap, token, relPath string) *Cask {
 	if regexp.MustCompile(`(?m)^\s*version\s+:latest\b`).MatchString(spec) {
 		c.Version = "latest"
 	}
-	vars := map[string]string{"token": token}
+	vars := map[string]string{"token": token, "appdir": caskAppdir()}
 	if m := rbArchRe.FindStringSubmatch(spec); m != nil {
 		kv := rbKV(m[1])
 		if _, arm, _ := rbTarget(); arm {
@@ -807,12 +811,16 @@ func parseTapCask(src, tap, token, relPath string) *Cask {
 		c.Name = append(c.Name, rbUnquote(m[1]))
 	}
 	for _, m := range rbAppRe.FindAllStringSubmatch(spec, -1) {
-		b, _ := json.Marshal(map[string][]string{"app": {rbExpand(rbUnquote(m[1]), c.Version, vars)}})
-		c.Artifacts = append(c.Artifacts, b)
+		if v := rbExpand(rbUnquote(m[1]), c.Version, vars); v != "" {
+			b, _ := json.Marshal(map[string][]string{"app": {v}})
+			c.Artifacts = append(c.Artifacts, b)
+		}
 	}
 	for _, m := range rbBinaryRe.FindAllStringSubmatch(spec, -1) {
-		b, _ := json.Marshal(map[string][]string{"binary": {rbExpand(rbUnquote(m[1]), c.Version, vars)}})
-		c.Artifacts = append(c.Artifacts, b)
+		if v := rbExpand(rbUnquote(m[1]), c.Version, vars); v != "" {
+			b, _ := json.Marshal(map[string][]string{"binary": {v}})
+			c.Artifacts = append(c.Artifacts, b)
+		}
 	}
 	for _, m := range rbCaskDepRe.FindAllStringSubmatch(spec, -1) {
 		if d := rbUnquote(m[1]); validDepName(d) {

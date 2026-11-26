@@ -542,7 +542,10 @@ func cmdUnpack(args []string) {
 			if f.URLs.Stable.Tag != "" {
 				a = append(a, "--branch", f.URLs.Stable.Tag)
 			}
-			cmd := exec.Command("git", append(a, f.URLs.Stable.URL, dir)...)
+			if strings.HasPrefix(f.URLs.Stable.URL, "-") || strings.HasPrefix(f.URLs.Stable.Tag, "-") {
+				odie("refusing to clone %s: invalid URL %q", f.Name, f.URLs.Stable.URL)
+			}
+			cmd := exec.Command("git", append(a, "--", f.URLs.Stable.URL, dir)...)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			if err := cmd.Run(); err != nil {
 				odie("git clone failed: %v", err)

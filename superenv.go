@@ -285,11 +285,11 @@ func cmdEnv(args []string) {
 		k, v := kv[0], kv[1]
 		switch shell {
 		case "fish":
-			fmt.Printf("set -gx %s %q\n", k, v)
+			fmt.Printf("set -gx %s %s\n", k, fishQuote(v))
 		case "csh", "tcsh":
-			fmt.Printf("setenv %s %s;\n", k, v)
+			fmt.Printf("setenv %s %s;\n", k, cshQuote(v, ""))
 		case "bash", "zsh", "sh", "ksh", "dash":
-			fmt.Printf("export %s=%q\n", k, v)
+			fmt.Printf("export %s=\"%s\"\n", k, shDQ(v))
 		default:
 			fmt.Printf("%s: %s\n", k, v)
 		}

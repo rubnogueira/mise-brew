@@ -208,7 +208,10 @@ func TestRecursionGuardWithGlobalFlags(t *testing.T) {
 		{"services", nil, true}, {"services", []string{"info", "x"}, true},
 		{"services", []string{"stop", "x"}, false}, {"tap", nil, true},
 		{"update-if-needed", nil, false}, {"update", nil, false}, {"cleanup", nil, false},
-		{"alias", nil, false}, {"fetch", []string{"x"}, false},
+		{"alias", nil, true}, {"alias", []string{"x=list"}, false}, {"fetch", []string{"x"}, false},
+		{"install", []string{"--help"}, true}, {"install", []string{"--", "--help"}, false},
+		{"edit", []string{"--print-path", "jq"}, true}, {"edit", []string{"jq"}, false},
+		{"home", []string{"jq"}, true},
 	} {
 		if got := isReadOnly(c.cmd, c.args); got != c.want {
 			t.Errorf("isReadOnly(%s %v) = %v, want %v", c.cmd, c.args, got, c.want)

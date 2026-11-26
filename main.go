@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -261,12 +262,28 @@ var readOnlyCommands = map[string]bool{
 	"--repository": true, "--version": true, "--env": true, "shellenv": true,
 	"config": true, "doctor": true, "commands": true, "help": true,
 	"analytics": true, "developer": true, "completions": true,
+	"home": true, "docs": true, "readall": true, "migrate": true, "vendor-install": true,
+	"setup-ruby": true, "install-bundler-gems": true,
 }
 
 // isReadOnly reports whether `brew cmd args...` is a read-only invocation.
 // cmd must already be canonical and stripped of leading global flags.
 func isReadOnly(cmd string, args []string) bool {
 	if readOnlyCommands[cmd] {
+		return true
+	}
+	for _, a := range args {
+		if a == "--" {
+			break
+		}
+		if a == "--help" || a == "-h" {
+			return true // `brew install --help` only prints usage
+		}
+	}
+	if cmd == "alias" && len(args) == 0 {
+		return true // listing aliases
+	}
+	if cmd == "edit" && slices.Contains(args, "--print-path") {
 		return true
 	}
 	sub := ""

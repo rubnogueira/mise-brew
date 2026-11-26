@@ -511,7 +511,7 @@ func infoFormula(f *Formula) {
 	mark := func(ds []string) string {
 		var out []string
 		for _, d := range ds {
-			if isFormulaInstalled(d) {
+			if depInstalled(d) {
 				out = append(out, d+" "+check())
 			} else {
 				out = append(out, d+" "+cross())
@@ -799,7 +799,7 @@ func infoCask(c *Cask) {
 		var ds []string
 		for _, d := range c.DependsOn.Formula {
 			m := cross()
-			if isFormulaInstalled(d) {
+			if depInstalled(d) {
 				m = check()
 			}
 			ds = append(ds, d+" "+m)
@@ -844,6 +844,12 @@ func infoJSON(o Opts, version string) {
 	}
 	var frefs []fref
 	var fnames, cnames []string
+	// Casks are resolved up front too; c is nil when only the API record is needed.
+	type cref struct {
+		token string
+		c     *Cask
+	}
+	var crefs []cref
 	switch {
 	case len(o.Pos) > 0:
 		for _, n := range o.Pos {
@@ -859,7 +865,7 @@ func infoJSON(o Opts, version string) {
 			}
 			if !o.onlyFormula() && version == "v2" {
 				if c := lookupCask(n); c != nil {
-					cnames = append(cnames, c.Token)
+					crefs = append(crefs, cref{c.Token, c})
 					continue
 				}
 			}
@@ -904,9 +910,19 @@ func infoJSON(o Opts, version string) {
 		printJSON(formulae)
 		return
 	}
-	casks := []any{}
 	for _, t := range cnames {
-		casks = append(casks, caskJSON(t))
+		var c *Cask
+		if isCaskInstalled(t) {
+			// A cask installed from a tap is reported from that tap.
+			if full := tapQualifiedDeclared("brew-cask", t); len(full) > 0 {
+				c = lookupCask(full[0])
+			}
+		}
+		crefs = append(crefs, cref{t, c})
+	}
+	casks := []any{}
+	for _, r := range crefs {
+		casks = append(casks, caskJSON(r.token, r.c))
 	}
 	printJSON(map[string]any{"formulae": formulae, "casks": casks})
 }
@@ -979,8 +995,15 @@ func nonNil(xs []string) []any {
 	return out
 }
 
-func caskJSON(token string) map[string]any {
-	m := rawCaskMap(token)
+// caskJSON returns the JSON record of cask token; c is the resolved cask
+// (nil to use the homebrew/cask API record).
+func caskJSON(token string, c *Cask) map[string]any {
+	var m map[string]any
+	if c != nil && !caskFromCore(c) {
+		m = caskMapFor(c)
+	} else {
+		m = rawCaskMap(token)
+	}
 	if m == nil {
 		m = map[string]any{"token": token, "full_token": token, "name": []any{token}, "version": nil}
 	}
@@ -990,11 +1013,36 @@ func caskJSON(token string) map[string]any {
 		if fi, err := os.Stat(filepath.Join(caskroom(), token, v)); err == nil {
 			m["installed_time"] = fi.ModTime().Unix()
 		}
-		if c := lookupCask(token); c != nil {
+		if c == nil {
+			c = lookupCask(token)
+		}
+		if c != nil {
 			m["outdated"] = c.Version != "latest" && !contains(caskVersions(token), c.Version)
 		}
 	} else {
 		m["installed"] = nil
+	}
+	return m
+}
+
+// caskMapFor builds a JSON record for a cask parsed from a third-party tap,
+// shaped like the API's: lists are [] rather than null.
+func caskMapFor(c *Cask) map[string]any {
+	b, err := json.Marshal(c)
+	if err != nil {
+		return nil
+	}
+	var m map[string]any
+	if json.Unmarshal(b, &m) != nil {
+		return nil
+	}
+	if c.FullToken == "" && c.Tap != "" {
+		m["full_token"] = c.Tap + "/" + c.Token
+	}
+	for _, k := range []string{"old_tokens", "name", "artifacts"} {
+		if m[k] == nil {
+			m[k] = []any{}
+		}
 	}
 	return m
 }
