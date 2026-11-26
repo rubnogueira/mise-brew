@@ -315,7 +315,16 @@ var artifactSingular = map[string]string{"Apps": "App", "Binaries": "Binary", "P
 
 func caskArtifacts(c *Cask) []caskArtifact {
 	var out []caskArtifact
-	appdir := "/Applications"
+	appdir := caskAppdir()
+	// resolve expands ~, $HOME, $APPDIR and $HOMEBREW_PREFIX in a target and
+	// roots a relative one in dir, as Homebrew does when it installs.
+	resolve := func(dir, target string) string {
+		t := expandCaskPath(target)
+		if filepath.IsAbs(t) || strings.HasPrefix(t, "~") {
+			return t
+		}
+		return filepath.Join(dir, t)
+	}
 	for _, raw := range c.Artifacts {
 		var m map[string]json.RawMessage
 		if json.Unmarshal(raw, &m) != nil {
@@ -327,37 +336,27 @@ func caskArtifacts(c *Cask) []caskArtifact {
 				continue
 			}
 			first, _ := list[0].(string)
-			target := ""
+			target := filepath.Base(first)
 			if len(list) > 1 {
 				if opts, ok := list[1].(map[string]any); ok {
-					if t, ok := opts["target"].(string); ok {
+					if t, ok := opts["target"].(string); ok && t != "" {
 						target = t
 					}
 				}
 			}
 			switch k {
 			case "app":
-				if target == "" {
-					target = filepath.Base(first)
-				}
-				out = append(out, caskArtifact{"Apps", first, filepath.Join(appdir, target)})
+				out = append(out, caskArtifact{kind: "Apps", name: first, target: resolve(appdir, target)})
 			case "binary":
-				if target == "" {
-					target = filepath.Base(first)
-				}
-				t := target
-				if !filepath.IsAbs(t) {
-					t = filepath.Join(brewPrefix(), "bin", t)
-				}
-				out = append(out, caskArtifact{"Binaries", first, expandCaveats(t)})
+				out = append(out, caskArtifact{kind: "Binaries", name: first, target: expandCaveats(resolve(filepath.Join(brewPrefix(), "bin"), target))})
 			case "pkg":
-				out = append(out, caskArtifact{"Pkgs", first, ""})
+				out = append(out, caskArtifact{kind: "Pkgs", name: first})
 			case "font":
-				out = append(out, caskArtifact{"Fonts", first, filepath.Join(homeDir(), "Library", "Fonts", filepath.Base(first))})
+				out = append(out, caskArtifact{kind: "Fonts", name: first, target: resolve(expandCaskPath("~/Library/Fonts"), filepath.Base(first))})
 			case "suite":
-				out = append(out, caskArtifact{"Suites", first, filepath.Join(appdir, filepath.Base(first))})
+				out = append(out, caskArtifact{kind: "Suites", name: first, target: resolve(appdir, target)})
 			case "manpage":
-				out = append(out, caskArtifact{"Manpages", first, ""})
+				out = append(out, caskArtifact{kind: "Manpages", name: first})
 			}
 		}
 	}
