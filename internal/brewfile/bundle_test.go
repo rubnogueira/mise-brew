@@ -55,6 +55,7 @@ brew "g"
 
 // Finding 11.
 func TestFallbackParserBlocks(t *testing.T) {
+	pinMacOS(t)
 	src := `if OS.linux?
   brew "linux-a"
 elsif OS.mac?

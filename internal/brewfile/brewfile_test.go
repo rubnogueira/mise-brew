@@ -10,7 +10,17 @@ import (
 	"github.com/rubnogueira/mise-brew/internal/testutil"
 )
 
+// pinMacOS evaluates Brewfile platform conditions as on an arm64 Mac, so the
+// expectations hold on any CI runner.
+func pinMacOS(t *testing.T) {
+	t.Helper()
+	oldOS, oldArch := hostOS, hostArch
+	hostOS, hostArch = "darwin", "arm64"
+	t.Cleanup(func() { hostOS, hostArch = oldOS, oldArch })
+}
+
 func TestParseBrewfile(t *testing.T) {
+	pinMacOS(t)
 	src := `# Brewfile
 tap "homebrew/bundle"
 tap "acme/tools", "https://example.com/acme/tools.git"

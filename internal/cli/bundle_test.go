@@ -475,7 +475,9 @@ func TestSuperenvCompilers(t *testing.T) {
 	if env["CC"] != filepath.Join(shims, "cc") || env["CXX"] != filepath.Join(shims, "c++") {
 		t.Errorf("CC=%s CXX=%s", env["CC"], env["CXX"])
 	}
-	if env["HOMEBREW_CC_REAL"] != filepath.Join(bin, "gcc-13") || env["HOMEBREW_CXX_REAL"] != filepath.Join(bin, "g++-13") || env["HOMEBREW_CXX"] != "g++-13" {
+	// The real compiler may come from the system (e.g. /usr/bin/gcc-13 on a
+	// Linux runner) or from the fake bin; it must be the named one either way.
+	if filepath.Base(env["HOMEBREW_CC_REAL"]) != "gcc-13" || filepath.Base(env["HOMEBREW_CXX_REAL"]) != "g++-13" || env["HOMEBREW_CXX"] != "g++-13" {
 		t.Errorf("real compilers: %v", env)
 	}
 	for _, k := range []string{"HOMEBREW_CC_REAL", "HOMEBREW_CXX_REAL", "HOMEBREW_CPP_REAL", "HOMEBREW_LD_REAL"} {

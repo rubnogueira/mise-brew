@@ -291,6 +291,10 @@ func StripRubyComment(l string) string {
 	return l
 }
 
+// hostOS and hostArch are the platform Brewfile conditions are evaluated for
+// (variables so tests can pin them).
+var hostOS, hostArch = runtime.GOOS, runtime.GOARCH
+
 func evalCond(c string) (bool, bool) {
 	c = strings.TrimSpace(c)
 	neg := false
@@ -300,13 +304,13 @@ func evalCond(c string) (bool, bool) {
 	var v bool
 	switch c {
 	case "OS.mac?", "OS.mac?()", "RUBY_PLATFORM.include?(\"darwin\")":
-		v = runtime.GOOS == "darwin"
+		v = hostOS == "darwin"
 	case "OS.linux?", "OS.linux?()":
-		v = runtime.GOOS == "linux"
+		v = hostOS == "linux"
 	case "Hardware::CPU.arm?":
-		v = runtime.GOARCH == "arm64"
+		v = hostArch == "arm64"
 	case "Hardware::CPU.intel?":
-		v = runtime.GOARCH == "amd64"
+		v = hostArch == "amd64"
 	case "true":
 		v = true
 	case "false":
