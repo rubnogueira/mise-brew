@@ -176,7 +176,11 @@ func cmdTapInfo(args []string) {
 		}
 		out = append(out, info{t, parts[0], strings.TrimPrefix(parts[1], "homebrew-"), "", ok, parts[0] == "homebrew", url, formulae})
 	}
-	if _, ok := o.Val("json"); ok {
+	if v, ok := o.Val("json"); ok {
+		// A bare --json means v1, Homebrew's default and only version.
+		if v != "" && v != "v1" {
+			odie("Invalid usage: invalid JSON version: %s", v)
+		}
 		printJSON(out)
 		return
 	}
