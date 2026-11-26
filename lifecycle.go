@@ -3,12 +3,15 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -141,8 +144,12 @@ func cmdInstall(args []string) {
 	}
 	var useKeys, applyKeys []string
 	var refs []pkgRef
+	var requested []string // formulae named on the command line
 	for _, name := range o.Pos {
 		ref := resolvePackage(name, o)
+		if ref.kind == "formula" && !o.Has("only-dependencies") {
+			requested = append(requested, baseName(ref.name))
+		}
 		if o.Has("only-dependencies") && ref.f != nil {
 			for _, d := range recursiveDeps(ref.f, depFilter{}) {
 				if !isFormulaInstalled(d) {
@@ -173,7 +180,22 @@ func cmdInstall(args []string) {
 		}
 		refs = append(refs, ref)
 	}
+	// mise does not mark an already-installed dependency as installed on
+	// request when it is named later; do it like Homebrew so autoremove keeps it.
+	markRequested := func() {
+		if asDep {
+			return
+		}
+		for _, n := range requested {
+			if isFormulaInstalled(n) {
+				markOnRequest(n)
+			}
+		}
+	}
 	if len(useKeys)+len(applyKeys) == 0 {
+		if !dry {
+			markRequested()
+		}
 		return
 	}
 	run := func(dryRun bool, r *miseRun) {
@@ -216,7 +238,9 @@ func cmdInstall(args []string) {
 		for _, n := range changed {
 			v := currentVersion(n)
 			if o.Has("skip-link") {
-				unlinkKeg(n, v, false)
+				if contains(requested, n) { // dependencies stay linked, as in Homebrew
+					unlinkKeg(n, v, false)
+				}
 			} else if o.Has("overwrite") && !isKegLinked(n) {
 				if f := lookupFormula(n); f == nil || !f.KegOnly {
 					_, _, _ = linkKeg(n, v, true, false)
@@ -231,6 +255,7 @@ func cmdInstall(args []string) {
 			}
 		}
 	}
+	markRequested()
 	for _, ref := range refs {
 		if ref.kind == "cask" && quarantine {
 			quarantineCask(baseName(ref.name))
@@ -257,8 +282,12 @@ func cmdReinstall(args []string) {
 	rejectUnsupportedInstallFlags(o)
 	env, quarantine := caskOptions(o)
 	for _, name := range o.Pos {
+		if !validPackageArg(name) {
+			odie("No available formula or cask with the name \"%s\".", name)
+		}
 		rack := ""
 		if !o.onlyCask() {
+			restoreReinstallBackup(baseName(stripCoreTap(name)))
 			rack = resolveInstalledFormula(name)
 		}
 		if rack != "" {
@@ -267,7 +296,7 @@ func cmdReinstall(args []string) {
 		}
 		if !o.onlyFormula() {
 			if t := resolveInstalledCask(name); t != "" {
-				reinstallCask(t, o.Has("zap"), env, quarantine)
+				reinstallCask(t, name, o.Has("zap"), env, quarantine)
 				continue
 			}
 		}
@@ -276,8 +305,76 @@ func cmdReinstall(args []string) {
 	}
 }
 
+// reinstallBackup is where reinstall/postinstall keep the current keg while
+// mise pours it again: Cellar/.<rack>.mise-brew-reinstall/<version>.
+func reinstallBackup(rack string) string {
+	return filepath.Join(cellar(), "."+rack+".mise-brew-reinstall")
+}
+
+// restoreReinstallBackup puts back kegs left aside by an interrupted
+// reinstall (for instance mise-brew was killed) and drops stale backups of
+// kegs that were reinstalled.
+func restoreReinstallBackup(rack string) {
+	if !validName(rack) {
+		return
+	}
+	backup := reinstallBackup(rack)
+	if !isDir(backup) {
+		return
+	}
+	defer lockPrefix()()
+	for _, v := range listDirNames(backup, true) {
+		keg := kegPath(rack, v)
+		if isDir(keg) {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(keg), 0o755); err != nil {
+			onoe("could not restore %s from %s: %v", keg, backup, err)
+			return
+		}
+		if err := os.Rename(filepath.Join(backup, v), keg); err != nil {
+			onoe("could not restore %s from %s: %v", keg, backup, err)
+			return
+		}
+		if !isDir(filepath.Join(optDir(), rack)) {
+			_ = setOptLink(rack, v)
+		}
+		opoo("Restored %s from an interrupted reinstall.", keg)
+	}
+	_ = os.RemoveAll(backup)
+}
+
+// holdSignals keeps SIGINT/SIGTERM/SIGHUP from killing mise-brew while a keg
+// is moved aside. mise, in the same process group, still gets the terminal's
+// signals, so an interrupted mise exits non-zero and the keg is restored.
+// Signals are caught rather than ignored so the mise child does not inherit
+// an ignored disposition.
+func holdSignals() (release func()) {
+	ch := make(chan os.Signal, 4)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case s := <-ch:
+				odebug("received %v; finishing the reinstall before exiting", s)
+			case <-done:
+				return
+			}
+		}
+	}()
+	return func() {
+		signal.Stop(ch)
+		close(done)
+	}
+}
+
 func reinstallFormula(rack string, dry bool, env []string) {
+	if !validName(rack) {
+		odie("No such keg: %s", cellar()+"/"+rack)
+	}
 	v := currentVersion(rack)
+	keg := kegPath(rack, v)
 	rackDir := filepath.Join(cellar(), rack)
 	if dry {
 		fmt.Printf("Would reinstall %s %s\n", rack, v)
@@ -286,41 +383,97 @@ func reinstallFormula(rack string, dry bool, env []string) {
 	if isPinned(rack) {
 		odie("%s is pinned. You must unpin it to reinstall.", rack)
 	}
+	if v == "" || !validName(v) {
+		odie("No such keg: %s", keg)
+	}
 	wasLinked := isKegLinked(rack)
 	onReq := true
-	if r := readReceipt(kegPath(rack, v)); r != nil {
+	if r := readReceipt(keg); r != nil {
 		onReq = r.InstalledOnRequest
 	}
-	backup := filepath.Join(cellar(), "."+rack+".mise-brew-reinstall")
-	unlock := lockPrefix()
-	_ = os.RemoveAll(backup)
-	unlinkKeg(rack, v, false)
-	if err := os.Rename(rackDir, backup); err != nil {
-		unlock()
-		odie("could not move %s aside: %v", rackDir, err)
+	others := map[string]bool{}
+	for _, x := range kegVersions(rack) {
+		if x != v {
+			others[x] = true
+		}
 	}
-	_ = os.Remove(filepath.Join(optDir(), rack))
+	// Only the current keg is moved aside; other installed versions stay.
+	backup := reinstallBackup(rack)
+	saved := filepath.Join(backup, v)
+	restoreReinstallBackup(rack)
+	if fileExists(backup) {
+		odie("%s is left from an interrupted reinstall; move its kegs back to %s or remove it.", backup, rackDir)
+	}
+	defer holdSignals()()
+	unlock := lockPrefix()
+	unlinkKeg(rack, v, false)
+	if err := os.MkdirAll(backup, 0o755); err != nil {
+		unlock()
+		odie("could not move %s aside: %v", keg, err)
+	}
+	if err := os.Rename(keg, saved); err != nil {
+		_ = os.Remove(backup)
+		if wasLinked {
+			_, _, _ = linkKeg(rack, v, false, false)
+		}
+		unlock()
+		odie("could not move %s aside: %v", keg, err)
+	}
+	if readLinkVersion(filepath.Join(optDir(), rack)) == v {
+		_ = os.Remove(filepath.Join(optDir(), rack))
+	}
 	_ = os.Remove(filepath.Join(linkedDir(), rack))
+	_ = os.Remove(rackDir) // only when no other version is installed
 	unlock()
 	ohai("Reinstalling %s", rack)
 	code := runMiseBrewStyle(&miseRun{extraEnv: env}, "bootstrap", "packages", "apply", "-y", formulaKeyFromBackup(rack, backup, v))
 	defer lockPrefix()()
-	if code != 0 || !isFormulaInstalled(rack) {
-		_ = os.RemoveAll(rackDir)
-		if err := os.Rename(backup, rackDir); err == nil {
-			_ = setOptLink(rack, v)
-			if wasLinked {
-				_, _, _ = linkKeg(rack, v, false, false)
-			}
+	poured := false
+	for _, x := range kegVersions(rack) {
+		if !others[x] {
+			poured = true
 		}
-		onoe("reinstall of %s failed; restored %s", rack, kegPath(rack, v))
-		if code == 0 {
-			code = 1
-		}
+	}
+	if code == 0 && poured {
+		_ = os.RemoveAll(backup)
+		setOnRequest(rack, onReq) // mise writes a fresh receipt; keep how it was installed
+		return
+	}
+	if code == 0 {
+		code = 1
+	}
+	// Put the old keg back. Whatever mise left at the same path is partial.
+	_ = os.RemoveAll(keg)
+	if err := os.MkdirAll(rackDir, 0o755); err == nil {
+		err = os.Rename(saved, keg)
+	}
+	if !isDir(keg) {
+		onoe("reinstall of %s failed and %s could not be restored; it was left in %s", rack, keg, saved)
 		exit(code)
 	}
-	_ = os.RemoveAll(backup)
-	setOnRequest(rack, onReq) // mise writes a fresh receipt; keep how it was installed
+	_ = os.Remove(backup)
+	if err := setOptLink(rack, v); err != nil {
+		onoe("reinstall of %s failed; restored %s but could not update %s: %v", rack, keg, filepath.Join(optDir(), rack), err)
+		exit(code)
+	}
+	if wasLinked {
+		// mise may have linked part of a new keg before failing.
+		for _, l := range brokenSymlinks() {
+			if resolvesIntoAny(l, []string{rackDir, filepath.Join(optDir(), rack)}) {
+				_ = os.Remove(l)
+			}
+		}
+		_, conflicts, err := linkKeg(rack, v, false, false)
+		if err == nil && len(conflicts) > 0 {
+			err = fmt.Errorf("%s already exists", conflicts[0].dst)
+		}
+		if err != nil {
+			onoe("reinstall of %s failed; restored %s but could not relink it: %v\nTo relink it, run:\n  brew link %s", rack, keg, err, rack)
+			exit(code)
+		}
+	}
+	onoe("reinstall of %s failed; restored %s", rack, keg)
+	exit(code)
 }
 
 // formulaKeyFromBackup builds the key while the keg (and its receipt) is moved aside.
@@ -333,12 +486,57 @@ func formulaKeyFromBackup(rack, backup, v string) string {
 	return "brew:" + rack
 }
 
-func reinstallCask(token string, zap bool, env []string, quarantine bool) {
+// caskKey is the mise key for an installed cask: tap-qualified when the cask
+// is declared (or was named) as owner/tap/token.
+func caskKey(token, typed string) string {
+	if full := tapQualifiedDeclared("brew-cask", token); len(full) > 0 {
+		return "brew-cask:" + full[0]
+	}
+	if n := strings.ToLower(stripCoreTap(typed)); isThirdPartyTapName(n) && baseName(n) == token {
+		return "brew-cask:" + n
+	}
+	return "brew-cask:" + token
+}
+
+// reinstallCask uninstalls the cask natively and has mise install it again.
+// The Caskroom entry is kept as a hard-linked copy and put back if mise
+// fails, so the cask stays known to brew; artifacts already removed from
+// their targets (apps, binaries) are not restored.
+func reinstallCask(token, typed string, zap bool, env []string, quarantine bool) {
+	if !validName(token) {
+		odie("Cask '%s' is not installed.", token)
+	}
 	ohai("Reinstalling Cask %s", token)
+	key := caskKey(token, typed)
+	room := filepath.Join(caskroom(), token)
+	backup := filepath.Join(caskroom(), "."+token+".mise-brew-reinstall")
+	defer holdSignals()()
+	_ = os.RemoveAll(backup)
+	if err := linkTree(room, backup); err != nil {
+		_ = os.RemoveAll(backup)
+		opoo("could not back up %s (%v); it cannot be restored if the reinstall fails", room, err)
+	}
+	defer os.RemoveAll(backup)
+	// restore puts the Caskroom entry back when nothing was (re)installed.
+	restore := func() bool {
+		if !isDir(backup) || isCaskInstalled(token) {
+			return false
+		}
+		_ = os.RemoveAll(room)
+		return os.Rename(backup, room) == nil
+	}
 	if err := nativeUninstallCask(token, zap, false); err != nil {
+		restore()
 		odie("%v", err)
 	}
-	if code := runMiseBrewStyle(&miseRun{extraEnv: env}, "bootstrap", "packages", "apply", "-y", "brew-cask:"+token); code != 0 {
+	code := runMiseBrewStyle(&miseRun{extraEnv: env}, "bootstrap", "packages", "apply", "-y", key)
+	if code != 0 || !isCaskInstalled(token) {
+		if code == 0 {
+			code = 1
+		}
+		if restore() {
+			onoe("reinstall of %s failed; restored %s. Its artifacts were removed; run `brew reinstall --cask %s` again once the problem is fixed.", token, room, token)
+		}
 		exit(code)
 	}
 	if quarantine {
@@ -346,14 +544,56 @@ func reinstallCask(token string, zap bool, env []string, quarantine bool) {
 	}
 }
 
+// linkTree recreates src at dst with hard links (and copies of symlinks), so
+// dst survives src being deleted without copying file data.
+func linkTree(src, dst string) error {
+	return filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, p)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		switch {
+		case d.IsDir():
+			return os.MkdirAll(target, 0o755)
+		case d.Type()&os.ModeSymlink != 0:
+			l, err := os.Readlink(p)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(l, target)
+		default:
+			return os.Link(p, target)
+		}
+	})
+}
+
 func cmdPostinstall(args []string) {
 	o := parseArgs(args, nil, nil)
 	o.applyGlobal()
+	for _, n := range o.Pos {
+		if validPackageArg(n) {
+			restoreReinstallBackup(baseName(stripCoreTap(n)))
+		}
+	}
 	for _, n := range requireInstalled(o.Pos) {
 		ohai("Postinstalling %s", n)
 		// mise runs a formula's post-install steps as part of pouring it.
 		reinstallFormula(n, false, nil)
 	}
+}
+
+// markOnRequest records that the user asked for name, unless its receipt
+// already says so (or there is no receipt to edit).
+func markOnRequest(name string) {
+	r := readReceipt(kegPath(name, currentVersion(name)))
+	if r == nil || (r.InstalledOnRequest && !r.InstalledAsDependency) {
+		return
+	}
+	setOnRequest(name, true)
 }
 
 func setOnRequest(name string, v bool) {
@@ -375,6 +615,11 @@ func cmdUninstall(args []string) {
 	var items []item
 	failed := false
 	for _, n := range o.Pos {
+		if !validPackageArg(n) {
+			onoe("No such keg: %s", cellar()+"/"+n)
+			failed = true
+			continue
+		}
 		if !o.onlyCask() {
 			if r := resolveInstalledFormula(n); r != "" {
 				items = append(items, item{"formula", r})
@@ -414,8 +659,18 @@ func cmdUninstall(args []string) {
 		deps := installedRuntimeDeps()
 		removing := map[string]bool{}
 		for _, it := range items {
-			if it.kind == "formula" {
-				removing[it.name] = true
+			removing[it.kind+":"+it.name] = true
+		}
+		// Installed casks with depends_on formula: count as dependents too.
+		caskUsers := map[string][]string{}
+		for _, t := range installedCasks() {
+			if removing["cask:"+t] {
+				continue
+			}
+			if c := lookupCask(t); c != nil {
+				for _, d := range c.DependsOn.Formula {
+					caskUsers[baseName(d)] = append(caskUsers[baseName(d)], t)
+				}
 			}
 		}
 		for _, it := range items {
@@ -424,10 +679,11 @@ func cmdUninstall(args []string) {
 			}
 			var users []string
 			for _, d := range installedDependents(it.name, deps) {
-				if !removing[d] {
+				if !removing["formula:"+d] {
 					users = append(users, d)
 				}
 			}
+			users = append(users, caskUsers[it.name]...)
 			if len(users) > 0 {
 				onoe("Refusing to uninstall %s\nbecause it is required by %s, which %s currently installed.\nYou can override this and force removal with:\n  brew uninstall --ignore-dependencies %s",
 					kegPath(it.name, currentVersion(it.name)), strings.Join(users, ", "), map[bool]string{true: "is", false: "are"}[len(users) == 1], it.name)
@@ -450,13 +706,16 @@ func cmdUninstall(args []string) {
 				}
 				continue
 			}
-			undeclare("brew:" + it.name)
+			restores := []func(){undeclare("brew:" + it.name)}
 			for _, full := range tapQualifiedDeclared("brew", it.name) {
-				undeclare("brew:" + full)
+				restores = append(restores, undeclare("brew:"+full))
 			}
 			func() {
 				defer lockPrefix()()
 				if err := removeKegs(it.name, versions); err != nil {
+					if isFormulaInstalled(it.name) {
+						runRestores(restores)
+					}
 					odie("%v", err)
 				}
 			}()
@@ -506,17 +765,27 @@ func uninstallCask(token string, zap, dry bool) {
 	err := nativeUninstallCask(token, zap, false)
 	if err != nil {
 		if isCaskInstalled(token) {
-			for _, r := range restores {
-				r()
-			}
+			runRestores(restores)
 		}
 		odie("%v", err)
+	}
+}
+
+// runRestores undoes undeclare calls, newest first.
+func runRestores(restores []func()) {
+	for i := len(restores) - 1; i >= 0; i-- {
+		restores[i]()
 	}
 }
 
 // autoremoveCandidates mirrors Homebrew: formulae installed as dependencies
 // (not declared in mise config, not installed on request) that nothing needs.
 func autoremoveCandidates() []string {
+	// Without mise's view of what is declared, every formula would look unneeded.
+	if err := packagesStatusErr(); err != nil {
+		odebug("not autoremoving: `mise bootstrap packages status` failed: %v", err)
+		return nil
+	}
 	declared := declaredSet("brew")
 	deps := installedRuntimeDeps()
 	// Also count current API dependencies: a newer version may need a formula
@@ -568,6 +837,9 @@ func autoremoveCandidates() []string {
 }
 
 func autoremove(dry, silentIfNone bool) {
+	if err := packagesStatusErr(); err != nil && !silentIfNone {
+		opoo("Not autoremoving anything: could not read mise's declared packages (%v).", err)
+	}
 	cands := autoremoveCandidates()
 	if len(cands) == 0 {
 		return
@@ -659,12 +931,23 @@ func cmdUpgrade(args []string) {
 	o.applyGlobal()
 	rejectUnsupportedInstallFlags(o)
 	env, quarantine := caskOptions(o)
+	ensureAPI()
 	dry := o.Has("dry-run")
 	g := greedyFrom(o)
 	var formulae, casks []outdatedItem
-	var pinned []string
+	var pinned, namedPinned []string
+	// Homebrew fails when a pinned formula is named explicitly.
+	finish := func() {
+		if len(namedPinned) > 0 {
+			exit(1)
+		}
+	}
 	if len(o.Pos) > 0 {
 		for _, n := range o.Pos {
+			if !validPackageArg(n) {
+				onoe("%s not installed", n)
+				exit(1)
+			}
 			if !o.onlyCask() {
 				if r := resolveInstalledFormula(n); r != "" {
 					items := outdatedFormulae([]string{r}, false)
@@ -672,7 +955,7 @@ func cmdUpgrade(args []string) {
 					case len(items) == 0:
 						opoo("%s %s already installed", r, currentVersion(r))
 					case isPinned(r):
-						opoo("Not upgrading %s, pinned at %s", r, pinnedVersion(r))
+						namedPinned = append(namedPinned, fmt.Sprintf("%s %s", r, strings.Join(items[0].InstalledVersions, ", ")))
 					default:
 						formulae = append(formulae, items...)
 					}
@@ -735,8 +1018,13 @@ func cmdUpgrade(args []string) {
 		ohai("Not upgrading %s:", plural(len(pinned), "pinned package"))
 		fmt.Println(strings.Join(pinned, "\n"))
 	}
+	if len(namedPinned) > 0 {
+		onoe("Not upgrading %s:", plural(len(namedPinned), "pinned package"))
+		fmt.Println(strings.Join(namedPinned, ", "))
+	}
 	all := append(append([]outdatedItem(nil), formulae...), casks...)
 	if len(all) == 0 && len(dependents) == 0 {
+		finish()
 		return
 	}
 	verb := "Upgrading"
@@ -756,6 +1044,7 @@ func cmdUpgrade(args []string) {
 		}
 	}
 	if dry {
+		finish()
 		return
 	}
 	if o.Has("ask") && !confirm("Do you want to proceed with the upgrade?") {
@@ -783,6 +1072,7 @@ func cmdUpgrade(args []string) {
 	if code != 0 {
 		exit(code)
 	}
+	finish()
 }
 
 func cmdUpdate(args []string) {
@@ -842,6 +1132,9 @@ func cmdOutdated(args []string) {
 	if len(o.Pos) > 0 {
 		fnames, cnames = []string{}, []string{}
 		for _, n := range o.Pos {
+			if !validPackageArg(n) {
+				odie("No such keg: %s", cellar()+"/"+n)
+			}
 			if r := resolveInstalledFormula(n); r != "" && !o.onlyCask() {
 				fnames = append(fnames, r)
 			} else if t := resolveInstalledCask(n); t != "" && !o.onlyFormula() {
@@ -859,13 +1152,24 @@ func cmdOutdated(args []string) {
 	if !o.onlyFormula() {
 		c = outdatedCasks(cnames, g)
 	}
+	// Homebrew: naming packages makes outdated fail when any of them is outdated.
+	finish := func() {
+		if len(o.Pos) > 0 && len(f)+len(c) > 0 {
+			exit(1)
+		}
+	}
 	if v, ok := o.Val("json"); ok {
 		if f == nil {
 			f = []outdatedItem{}
 		}
-		if v == "" || v == "v1" {
+		switch v {
+		case "", "v2": // bare --json means v2 for outdated
+		case "v1":
 			printJSON(f)
+			finish()
 			return
+		default:
+			odie("Invalid usage: invalid JSON version: %s", v)
 		}
 		type caskItem struct {
 			Name              string   `json:"name"`
@@ -877,6 +1181,7 @@ func cmdOutdated(args []string) {
 			cs = append(cs, caskItem{x.Name, x.InstalledVersions, x.CurrentVersion})
 		}
 		printJSON(map[string]any{"formulae": f, "casks": cs})
+		finish()
 		return
 	}
 	detailed := (stdoutTTY || verbose) && !quiet
@@ -893,6 +1198,7 @@ func cmdOutdated(args []string) {
 			fmt.Println(line)
 		}
 	}
+	finish()
 }
 
 // --- cleanup ----------------------------------------------------------------
@@ -918,11 +1224,18 @@ func cmdCleanup(args []string) {
 		}
 	}
 	for _, n := range o.Pos {
-		if r := resolveInstalledFormula(n); r != "" {
+		if !validPackageArg(n) {
+			opoo("No installed formula or cask with the name \"%s\".", n)
+		} else if r := resolveInstalledFormula(n); r != "" {
 			c.names = append(c.names, r)
 		} else if t := resolveInstalledCask(n); t != "" {
 			c.names = append(c.names, "cask:"+t)
+		} else {
+			opoo("No installed formula or cask with the name \"%s\".", n)
 		}
+	}
+	if len(o.Pos) > 0 && len(c.names) == 0 {
+		return // never fall back to cleaning up everything
 	}
 	doCleanup(c)
 	if len(o.Pos) == 0 && !c.dry {
@@ -938,6 +1251,10 @@ func doCleanup(c cleanupOpts) int64 {
 		verb = "Would remove"
 	}
 	remove := func(p string, size int64, summary string) {
+		if !cleanupAllowed(p) {
+			opoo("Refusing to remove %s: not a keg, cask version or cache file.", p)
+			return
+		}
 		fmt.Printf("%s: %s%s\n", verb, p, summary)
 		freed += size
 		if !c.dry {
@@ -965,6 +1282,7 @@ func doCleanup(c cleanupOpts) int64 {
 				}
 			}
 		}
+		formulae, casks = filterValidNames(formulae), filterValidNames(casks)
 		// Old kegs.
 		for _, n := range formulae {
 			if isPinned(n) {
@@ -1039,7 +1357,7 @@ func doCleanup(c cleanupOpts) int64 {
 				}
 			}
 			// Logs.
-			logs := filepath.Join(homeDir(), "Library", "Logs", "Homebrew")
+			logs := logsDir()
 			if entries, err := os.ReadDir(logs); err == nil {
 				for _, e := range entries {
 					if info, err := e.Info(); err == nil && (old(info.ModTime()) || c.scrub) {
@@ -1070,6 +1388,47 @@ func doCleanup(c cleanupOpts) int64 {
 		}
 	}
 	return freed
+}
+
+// logsDir is where Homebrew (and so `brew cleanup`) keeps build logs.
+func logsDir() string { return filepath.Join(homeDir(), "Library", "Logs", "Homebrew") }
+
+func filterValidNames(names []string) []string {
+	var out []string
+	for _, n := range names {
+		if validName(n) {
+			out = append(out, n)
+		} else {
+			odebug("cleanup: skipping invalid name %q", n)
+		}
+	}
+	return out
+}
+
+// plainEntry is a directory entry name that cannot escape its parent.
+func plainEntry(s string) bool {
+	return s != "" && !strings.HasPrefix(s, ".") && !strings.ContainsAny(s, `/\`)
+}
+
+// cleanupAllowed reports whether p is something doCleanup may delete:
+// <Cellar>/<rack>/<version> (or an interrupted .mise-extract-* there),
+// <Caskroom>/<token>/<version>, or a file directly in the bottle, download
+// or log directories.
+func cleanupAllowed(p string) bool {
+	if !filepath.IsAbs(p) || filepath.Clean(p) != p {
+		return false
+	}
+	parent, base := filepath.Dir(p), filepath.Base(p)
+	grand, mid := filepath.Dir(parent), filepath.Base(parent)
+	switch {
+	case grand == cellar() && validName(mid):
+		return plainEntry(base) || (strings.HasPrefix(base, ".mise-extract-") && plainEntry(strings.TrimPrefix(base, ".mise-extract-")))
+	case grand == caskroom() && validName(mid):
+		return plainEntry(base)
+	case parent == bottlesDir(), parent == filepath.Join(miseBrewCacheDir(), "downloads"), parent == logsDir():
+		return base != "." && base != ".." && !strings.ContainsAny(base, `/\`)
+	}
+	return false
 }
 
 func cleanedStamp() string { return filepath.Join(miseBrewCacheDir(), ".cleaned") }
