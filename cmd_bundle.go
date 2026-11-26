@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -212,6 +214,9 @@ func rubyBrewfile(ruby, path string) (entries []brewfileEntry, incomplete bool, 
 	}
 	cmd := exec.Command(ruby, "--disable-gems", shim, abs, outFile)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if path == "-" {
+		cmd.Stdin = bytes.NewReader(stdinBrewfile())
+	}
 	if path != "-" {
 		cmd.Dir = filepath.Dir(abs)
 	}
@@ -538,22 +543,47 @@ func readBrewfile(o Opts) (entries []brewfileEntry, incomplete bool) {
 	if p != "-" && !fileExists(p) {
 		odie("No Brewfile found: %s", p)
 	}
+	rubyFailed := false
 	if ruby := findRuby(); ruby != "" && os.Getenv("MISEBREW_BUNDLE_NO_RUBY") == "" {
 		entries, incomplete, err := rubyBrewfile(ruby, p)
 		if err == nil {
 			return entries, incomplete
 		}
 		opoo("%v; falling back to the built-in Brewfile parser", err)
+		// Ruby could not evaluate it, so the fallback parse is a best effort:
+		// never let a destructive cleanup trust it.
+		rubyFailed = true
 	}
 	if p == "-" {
-		return parseBrewfileFallback(os.Stdin, "stdin")
+		entries, incomplete := parseBrewfileFallback(bytes.NewReader(stdinBrewfile()), "stdin")
+		return entries, incomplete || rubyFailed
 	}
 	f, err := os.Open(p)
 	if err != nil {
 		odie("No Brewfile found: %s", p)
 	}
 	defer f.Close()
-	return parseBrewfileFallback(f, p)
+	entries, incomplete = parseBrewfileFallback(f, p)
+	return entries, incomplete || rubyFailed
+}
+
+var (
+	stdinBrewfileOnce sync.Once
+	stdinBrewfileData []byte
+)
+
+// stdinBrewfile returns a Brewfile given as --file=-. Stdin can only be read
+// once, but install --cleanup parses the Brewfile twice (and Ruby may fail
+// after consuming it), so the bytes are read a single time and reused.
+func stdinBrewfile() []byte {
+	stdinBrewfileOnce.Do(func() {
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			odie("reading Brewfile from stdin: %v", err)
+		}
+		stdinBrewfileData = data
+	})
+	return stdinBrewfileData
 }
 
 // refuseIncomplete stops a cleanup that would act on a partially parsed Brewfile.
@@ -1539,7 +1569,34 @@ func runWithServices(formulae []string, path string, cmdArgs, env []string) {
 	cmd := exec.Command(path, cmdArgs[1:]...)
 	cmd.Env = env
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	exit(exitCode(cmd.Run()))
+	if err := cmd.Start(); err != nil {
+		onoe("%v", err)
+		exit(127)
+	}
+	// Forward SIGTERM sent to brew alone (kill, timeout(1), a supervisor) to
+	// the child; remember the last signal so brew exits like it was killed by it
+	// once the services are stopped.
+	var got os.Signal
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	var err error
+	for done := false; !done; {
+		select {
+		case sig := <-sigs:
+			got = sig
+			// A terminal Ctrl-C already reached the child through the
+			// process group; sending it twice makes many tools force-quit.
+			if sig != os.Interrupt {
+				_ = cmd.Process.Signal(sig)
+			}
+		case err = <-waited:
+			done = true
+		}
+	}
+	if s, ok := got.(syscall.Signal); ok && got != nil {
+		exit(128 + int(s))
+	}
+	exit(exitCode(err))
 }
 
 // bundleEntryRe matches entries of the given kinds and names anywhere in a

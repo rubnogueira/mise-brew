@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -349,14 +350,23 @@ func restoreReinstallBackup(rack string) {
 // signals, so an interrupted mise exits non-zero and the keg is restored.
 // Signals are caught rather than ignored so the mise child does not inherit
 // an ignored disposition.
+//
+// A signal received meanwhile is not forgotten: once the critical section is
+// over (the keg reinstalled or restored), release exits with 128+signal, so
+// Ctrl-C, timeout(1) and supervisors still stop the command.
 func holdSignals() (release func()) {
 	ch := make(chan os.Signal, 4)
 	signal.Notify(ch, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	var mu sync.Mutex
+	var got os.Signal
 	done := make(chan struct{})
 	go func() {
 		for {
 			select {
 			case s := <-ch:
+				mu.Lock()
+				got = s
+				mu.Unlock()
 				odebug("received %v; finishing the reinstall before exiting", s)
 			case <-done:
 				return
@@ -366,6 +376,20 @@ func holdSignals() (release func()) {
 	return func() {
 		signal.Stop(ch)
 		close(done)
+		mu.Lock()
+		s := got
+		mu.Unlock()
+		select {
+		case s = <-ch:
+		default:
+		}
+		if s == nil {
+			return
+		}
+		if sig, ok := s.(syscall.Signal); ok {
+			exit(128 + int(sig))
+		}
+		exit(130)
 	}
 }
 
@@ -383,7 +407,7 @@ func reinstallFormula(rack string, dry bool, env []string) {
 	if isPinned(rack) {
 		odie("%s is pinned. You must unpin it to reinstall.", rack)
 	}
-	if v == "" || !validName(v) {
+	if v == "" || !validVersion(v) {
 		odie("No such keg: %s", keg)
 	}
 	wasLinked := isKegLinked(rack)
@@ -404,8 +428,10 @@ func reinstallFormula(rack string, dry bool, env []string) {
 	if fileExists(backup) {
 		odie("%s is left from an interrupted reinstall; move its kegs back to %s or remove it.", backup, rackDir)
 	}
-	defer holdSignals()()
+	// Wait for the lock before holding signals: nothing has moved yet, so
+	// Ctrl-C while another mise or brew runs must still work.
 	unlock := lockPrefix()
+	defer holdSignals()()
 	unlinkKeg(rack, v, false)
 	if err := os.MkdirAll(backup, 0o755); err != nil {
 		unlock()
@@ -418,6 +444,25 @@ func reinstallFormula(rack string, dry bool, env []string) {
 		}
 		unlock()
 		odie("could not move %s aside: %v", keg, err)
+	}
+	// Other versions go aside too, so mise sees the formula as missing and
+	// pours it again; they are put back afterwards, whatever happens.
+	var movedOthers []string
+	for x := range others {
+		if os.Rename(kegPath(rack, x), filepath.Join(backup, x)) == nil {
+			movedOthers = append(movedOthers, x)
+		}
+	}
+	putOthersBack := func() {
+		for _, x := range movedOthers {
+			if isDir(kegPath(rack, x)) {
+				continue // mise poured this version again; keep its keg
+			}
+			_ = os.MkdirAll(rackDir, 0o755)
+			if err := os.Rename(filepath.Join(backup, x), kegPath(rack, x)); err != nil {
+				onoe("could not put %s back: %v; it is in %s", kegPath(rack, x), err, backup)
+			}
+		}
 	}
 	if readLinkVersion(filepath.Join(optDir(), rack)) == v {
 		_ = os.Remove(filepath.Join(optDir(), rack))
@@ -434,8 +479,14 @@ func reinstallFormula(rack string, dry bool, env []string) {
 			poured = true
 		}
 	}
+	putOthersBack()
 	if code == 0 && poured {
-		_ = os.RemoveAll(backup)
+		// Drop only the reinstalled keg's copy; anything else left in the
+		// backup (a version that could not be put back) is kept and reported.
+		_ = os.RemoveAll(saved)
+		if os.Remove(backup) != nil && fileExists(backup) {
+			opoo("%s still holds kegs that could not be put back.", backup)
+		}
 		setOnRequest(rack, onReq) // mise writes a fresh receipt; keep how it was installed
 		return
 	}
