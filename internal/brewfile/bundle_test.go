@@ -1,7 +1,6 @@
 package brewfile
 
 import (
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -94,9 +93,9 @@ brew "tail" # comment, with comma,
 	for _, e := range es {
 		got[e.Name] = e
 	}
-	mac := runtime.GOOS == "darwin"
+	mac := hostOS == "darwin"
 	want := map[string]bool{
-		"linux-a": runtime.GOOS == "linux", "mac-a": mac, "other-a": !mac && runtime.GOOS != "linux",
+		"linux-a": hostOS == "linux", "mac-a": mac, "other-a": !mac && hostOS != "linux",
 		"never": false, "elsif-taken": true, "second-elsif": false, "else-after-taken": false,
 		"mac-after-block": mac, "multi": true, "args": true, "tail": true,
 	}
