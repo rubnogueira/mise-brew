@@ -210,12 +210,16 @@ dispatch:
 		if code, ok := runAlias(argv[0], rest); ok {
 			return code
 		}
-		if path, err := exec.LookPath("brew-" + name); err == nil {
-			return execExternal(path, rest)
-		}
-		if path, err := exec.LookPath("brew-" + name + ".rb"); err == nil {
-			onoe("external Ruby command %s is not supported by mise-brew", path)
-			return 1
+		// External commands are looked up on PATH by name only; a name with
+		// a path separator would make LookPath resolve it relative to cwd.
+		if validName(name) {
+			if path, err := exec.LookPath("brew-" + name); err == nil {
+				return execExternal(path, rest)
+			}
+			if path, err := exec.LookPath("brew-" + name + ".rb"); err == nil {
+				onoe("external Ruby command %s is not supported by mise-brew", path)
+				return 1
+			}
 		}
 		onoe("Unknown command: brew %s", argv[0])
 		return 1

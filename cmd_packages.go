@@ -422,6 +422,13 @@ func cmdLink(args []string) {
 		if len(conflicts) > 0 {
 			c := conflicts[0]
 			fmt.Printf("Linking %s...\n", keg)
+			if o.Has("overwrite") {
+				// --overwrite only replaces files, symlinks and empty
+				// directories; anything left is a real directory or a
+				// directory link that points outside the Cellar.
+				onoe("Could not symlink %s\nTarget %s\nis a directory (or a link to one outside the Cellar) that --overwrite will not replace.\nMove or remove it yourself, then run:\n  brew link %s", c.rel, c.dst, n)
+				exit(1)
+			}
 			onoe("Could not symlink %s\nTarget %s\nalready exists. You may want to remove it:\n  rm '%s'\n\nTo force the link and overwrite all conflicting files:\n  brew link --overwrite %s\n\nTo list all files that would be deleted:\n  brew link --overwrite %s --dry-run", c.rel, c.dst, c.dst, n, n)
 			exit(1)
 		}

@@ -291,6 +291,7 @@ func TestParseArgs(t *testing.T) {
 }
 
 func TestUndeclareRestore(t *testing.T) {
+	isolateMise(t, "")
 	dir := t.TempDir()
 	cfg := filepath.Join(dir, "mise.toml")
 	orig := "[bootstrap.packages]\n\"brew:keep-me\" = \"latest\"\n\"brew-cask:mise-brew-test-cask\" = \"latest\"\n"
@@ -460,6 +461,10 @@ func TestAutoremoveCandidates(t *testing.T) {
 	for _, n := range []string{"mbt-lib", "mbt-orphan"} {
 		write(t, filepath.Join(kegPath(n, "1"), "INSTALL_RECEIPT.json"), `{"installed_on_request":false,"installed_as_dependency":true}`)
 	}
+	// Pretend mise reported an empty status so the test doesn't run the real mise.
+	oldCache, oldErr := statusCache, statusErr
+	statusCache, statusErr = map[string]managerStatus{}, nil
+	t.Cleanup(func() { statusCache, statusErr = oldCache, oldErr })
 	if got := autoremoveCandidates(); strings.Join(got, ",") != "mbt-orphan" {
 		t.Errorf("candidates = %v", got)
 	}
