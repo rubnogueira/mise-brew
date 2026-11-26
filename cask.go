@@ -858,7 +858,7 @@ func caskFallbackTargets(c *Cask) []caskArtifact {
 				opoo("Skipping %s '%s': the home directory is unknown", kind, target)
 				continue
 			}
-			out = append(out, caskArtifact{kind, source, p})
+			out = append(out, caskArtifact{kind: kind, name: source, target: p})
 		}
 	}
 	return out
