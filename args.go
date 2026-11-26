@@ -37,6 +37,10 @@ func parseArgs(args []string, valueFlagList []string, short map[string]string) O
 	for _, f := range append(valueFlagList, valueFlags(currentCmd)...) {
 		takesValue[f] = true
 	}
+	// --json[=v2]-style flags bind a value only when it is attached.
+	for _, f := range optionalValueFlags(currentCmd) {
+		delete(takesValue, f)
+	}
 	merged := shortMap(currentCmd)
 	for k, v := range short {
 		merged[k] = v
@@ -128,4 +132,17 @@ func (o Opts) applyGlobal() {
 	if o.Has("debug") {
 		debug = true
 	}
+}
+
+// withFlag returns a copy of o with flag k set; o itself is not modified.
+func (o Opts) withFlag(k, v string) Opts {
+	c := Opts{flags: make(map[string]string, len(o.flags)+1), order: append([]string(nil), o.order...), Pos: o.Pos}
+	for kk, vv := range o.flags {
+		c.flags[kk] = vv
+	}
+	if _, ok := c.flags[k]; !ok {
+		c.order = append(c.order, k)
+	}
+	c.flags[k] = v
+	return c
 }

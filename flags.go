@@ -11,10 +11,14 @@ type flagSpec struct {
 	short string
 	long  string
 	value bool // takes a value (--long=VALUE or --long VALUE)
-	desc  string
+	// optional: the value may only be attached (--long=VALUE); a bare --long
+	// is valid on its own and never consumes the next argument.
+	optional bool
+	desc     string
 }
 
-// Spec lines: "-s, --long=  description" ("=" marks a value flag; short is optional).
+// Spec lines: "-s, --long=  description" ("=" marks a value flag, "[=]" an
+// optional-value flag such as --json[=v2]; short is optional).
 var globalFlagLines = `
 -d, --debug  Display any debugging information.
 -q, --quiet  Make some output more quiet.
@@ -96,7 +100,7 @@ var commandFlagLines = map[string]string{
 	"outdated": `
 --formula, --formulae  List only outdated formulae.
 --cask, --casks  List only outdated casks.
---json=  Print output in JSON format (v1 or v2).
+--json[=]  Print output in JSON format (v2, the default, or v1).
 --fetch-HEAD  Fetch the upstream repository to detect if the HEAD installation is outdated.
 -g, --greedy  Also include outdated casks with auto_updates true or version :latest.
 --greedy-latest  Also include outdated casks including those with version :latest.
@@ -155,7 +159,7 @@ var commandFlagLines = map[string]string{
 -f, --force  Untap even if formulae or casks from this tap are currently installed.`,
 	"tap-info": `
 --installed  Show information on each installed tap.
---json=  Print a JSON representation of tap. Currently the default and only accepted value is v1.`,
+--json[=]  Print a JSON representation of tap. Currently the default and only accepted value is v1.`,
 	"link": `
 --overwrite  Delete files that already exist in the prefix while linking.
 -n, --dry-run  List files which would be linked or deleted by brew link --overwrite without actually linking or deleting any files.
@@ -197,7 +201,7 @@ var commandFlagLines = map[string]string{
 --category=  Which type of analytics data to retrieve (install, install-on-request, build-error, cask-install).
 --github  Open the GitHub source page for formula and cask in a browser.
 --fetch-manifest  Fetch GitHub Packages manifest for extra information when formula is not installed.
---json=  Print a JSON representation (v1 or v2).
+--json[=]  Print a JSON representation (v1 or v2).
 --installed  Print JSON of formulae that are currently installed.
 --eval-all  Evaluate all available formulae and casks to print their JSON.
 --variations  Include the variations hash in each formula's JSON output.
@@ -400,9 +404,12 @@ func parseFlagLines(lines string) []flagSpec {
 				short = append(short, part[1:])
 			}
 		}
-		value := false
+		value, optional := false, false
 		for i, lg := range longs {
-			if strings.HasSuffix(lg, "=") {
+			if strings.HasSuffix(lg, "[=]") {
+				optional = true
+				longs[i] = strings.TrimSuffix(lg, "[=]")
+			} else if strings.HasSuffix(lg, "=") {
 				value = true
 				longs[i] = strings.TrimSuffix(lg, "=")
 			}
@@ -416,7 +423,7 @@ func parseFlagLines(lines string) []flagSpec {
 			continue
 		}
 		for i, lg := range longs {
-			fs := flagSpec{long: lg, value: value, desc: strings.TrimSpace(desc)}
+			fs := flagSpec{long: lg, value: value, optional: optional, desc: strings.TrimSpace(desc)}
 			if i == 0 {
 				fs.short = s
 			}
@@ -469,6 +476,18 @@ func valueFlags(cmd string) []string {
 	return out
 }
 
+// optionalValueFlags lists flags whose value must be attached (--json=v2); a
+// bare --json is complete and never takes the next argument.
+func optionalValueFlags(cmd string) []string {
+	var out []string
+	for _, s := range commandSpecs[cmd] {
+		if s.optional {
+			out = append(out, s.long)
+		}
+	}
+	return out
+}
+
 func lenient() bool { return os.Getenv("MISEBREW_LENIENT") != "" }
 
 // validateFlags rejects options Homebrew would reject, like brew's own parser.
@@ -497,7 +516,7 @@ func validateFlags(cmd string, args []string) {
 			if !ok {
 				invalidOption(cmd, a)
 			}
-			if s.value && !hasV {
+			if s.value && !s.optional && !hasV {
 				if i+1 >= len(args) {
 					onoe("Invalid usage: option --%s requires an argument", k)
 					exit(1)
